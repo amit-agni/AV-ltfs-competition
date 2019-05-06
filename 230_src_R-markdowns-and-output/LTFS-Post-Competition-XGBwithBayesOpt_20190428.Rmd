@@ -1,0 +1,1024 @@
+---
+title: "XGB with Bayes Opt"
+author: "Amit Agni"
+date: "25/04/2019"
+output: html_document
+---
+
+### Initial Setup and Data Load
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+if (!require("pacman")) install.packages("pacman")
+p_load(caret,data.table,dplyr,lubridate
+       ,here,DescTools,DataExplorer,tidyverse
+       ,googledrive,e1071,ggcorrplot,forcats
+       ,xgboost,DiagrammeR,ROCR,cutpointr
+       ,MlBayesOpt,rBayesianOptimization)
+
+options(scipen=999) #remove scientific notation in printing 
+
+
+####### parallel on windows #######
+p_load(doParallel)
+cl <- makeCluster(detectCores(), type='PSOCK')
+#registerDoParallel(1)
+registerDoParallel(cl)
+
+# turn parallel processing off and run sequentially again:
+# registerDoSEQ()
+
+#####################################
+# parallel::detectCores()
+# 
+# p_load(doMC)
+# 
+# registerDoMC(cores = 4)
+# 
+# dribble <- drive_find(pattern="train.csv")
+# drive_download(as_dribble(dribble),overwrite = TRUE)
+# 
+# dribble <- drive_find(pattern="test.csv")
+# drive_download(as_dribble(dribble),overwrite = TRUE)
+# 
+# DT_train <- fread(here::here("train.csv"))
+# DT_test <- fread(here::here("test.csv"))
+#####################################
+
+
+DT_train <- fread(here::here("100_data_raw-input","train.csv"))
+DT_test <- fread(here::here("100_data_raw-input","test.csv"))
+DT_train$flag <- "train"
+DT_test$flag <- "test"
+DT_test$loan_default <- 1
+DT <- rbind(DT_train,DT_test)
+rm(DT_train)
+rm(DT_test)
+
+
+#### Remove the test observations ###############
+DT <- DT[flag=="train",]
+
+
+```
+
+
+### Feat Engg
+```{r}
+
+
+##################### Basic Cleanup #####################
+
+#to avoid date of births like 2068 instead of 1968
+DT$Date.of.Birth <- dplyr::if_else(dmy(DT$Date.of.Birth) > Sys.Date(),
+                                   dmy(DT$Date.of.Birth) - years(100),
+                                   dmy(DT$Date.of.Birth))
+DT$DisbursalDate <- dmy(DT$DisbursalDate)
+
+#Some Employment types are blank
+#Set them fo Self Employed (TO DO : Missing value Imputation)
+DT[flag=="train",.N,by=.(Employment.Type,loan_default)]
+DT[flag=="test",.N,by=.(Employment.Type,loan_default)]
+DT[,Employment.Type := ifelse(Employment.Type == "","Self employed",as.character(Employment.Type))]
+
+#remove ID column and mobile no (one level)
+DT$UniqueID <- NULL
+DT$MobileNo_Avl_Flag <- NULL
+
+
+########################## FLAG columns change to Factors ###########
+
+temp <- c("Employment.Type","Aadhar_flag","PAN_flag","VoterID_flag","Driving_flag","Passport_flag")
+DT[, (temp) := lapply(.SD, as.factor),.SDcols = temp]
+
+
+
+
+
+
+##################### DATES  #####################
+
+#source :https://stackoverflow.com/questions/1995933/number-of-months-between-two-dates/1996404
+#option did not work
+#https://stackoverflow.com/questions/10836503/convert-difftime-time-to-years-months-and-days
+#DT$age.at.disbursal <- as.POSIXct(c(difftime(DT$DisbursalDate,DT$Date.of.Birth, units = "secs")),origin = DT$Date.of.Birth)
+
+
+#convert into months
+DT[,avg.acct.age.months := as.integer(str_extract_all(AVERAGE.ACCT.AGE,"[0-9]+",simplify = TRUE)[,1]) * 12 +
+       as.integer(str_extract_all(AVERAGE.ACCT.AGE,"[0-9]+",simplify = TRUE)[,2])]
+DT[,time.since.first.loan.months := as.integer(str_extract_all(CREDIT.HISTORY.LENGTH,"[0-9]+",simplify = TRUE)[,1]) * 12 + 
+       as.integer(str_extract_all(CREDIT.HISTORY.LENGTH,"[0-9]+",simplify = TRUE)[,2])]
+DT$age.at.disbursal <- interval(DT$Date.of.Birth,DT$DisbursalDate) %/% months(1)
+DT$age.today <- interval(DT$Date.of.Birth,Sys.Date()) %/% months(1)
+
+
+DT[,`:=`(age.at.disbursal=round(age.at.disbursal/12,0)
+          ,age.today=round(age.today/12,0)
+          ,avg.acct.age.months=round(avg.acct.age.months/12,0)
+          ,time.since.first.loan.months=round(time.since.first.loan.months/12,0))]
+
+DT[,`:=`(age.when.first.loan = age.today - time.since.first.loan.months,
+         time.left.to.repay = avg.acct.age.months - time.since.first.loan.months)]
+
+
+lapply(DT[,.(age.at.disbursal
+         ,age.today
+         ,avg.acct.age.months
+         ,time.since.first.loan.months
+         ,age.when.first.loan
+         ,time.left.to.repay)],
+       function(x) prop.table(table(x)))
+
+
+#age.today
+#hist(DT$age.today)
+prop.table(table(cut(DT$age.today, 
+                     breaks=c(quantile(DT$age.today
+                                       ,probs = seq(0,1,0.25))))))
+DT[,age.today := cut(DT$age.today, 
+                                 breaks=c(quantile(DT$age.today
+                                                   ,probs = seq(0,1,0.25)))
+                                 ,ordered = TRUE)]
+
+#hist(DT$avg.acct.age.months)
+group_category(data = DT, feature = "avg.acct.age.months", threshold = 0.1,update = TRUE)
+DT[,avg.acct.age.months:=factor(avg.acct.age.months,ordered = TRUE)]
+
+
+#hist(DT$time.since.first.loan.months)
+group_category(data = DT, feature = "time.since.first.loan.months", threshold = 0.2,update = TRUE)
+DT[,time.since.first.loan.months:=factor(time.since.first.loan.months,ordered = TRUE)]
+
+
+#hist(DT$age.when.first.loan)
+prop.table(table(cut(DT$age.when.first.loan, 
+                     breaks=c(quantile(DT$age.when.first.loan
+                                       ,probs = seq(0,1,0.25))))))
+DT[,age.when.first.loan := cut(DT$age.when.first.loan, 
+                     breaks=c(quantile(DT$age.when.first.loan
+                                       ,probs = seq(0,1,0.25)))
+                     ,ordered = TRUE)]
+
+#hist(DT$time.left.to.repay)
+DT[,time.left.to.repay := factor(as.character(if_else(time.left.to.repay<0,1,0)))]
+
+
+
+DT$AVERAGE.ACCT.AGE <- NULL
+DT$CREDIT.HISTORY.LENGTH <- NULL
+DT$Date.of.Birth <- NULL
+DT$DisbursalDate <- NULL
+DT$age.at.disbursal <-NULL
+
+
+
+
+################### CREDIT SCORE  ###########
+
+prop.table(table(DT$PERFORM_CNS.SCORE.DESCRIPTION))
+
+DT[,PERFORM_CNS.SCORE.DESCRIPTION.new :=
+            case_when(
+                PERFORM_CNS.SCORE.DESCRIPTION == 'A-Very Low Risk' ~ 'Low',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'B-Very Low Risk' ~ 'Low',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'C-Very Low Risk' ~ 'Low',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'D-Very Low Risk' ~ 'Low',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'E-Low Risk' ~ 'Low',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'F-Low Risk' ~ 'Low',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'G-Low Risk' ~ 'Low',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'H-Medium Risk' ~ 'Med',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'I-Medium Risk' ~ 'Med',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'J-High Risk' ~ 'High',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'K-High Risk' ~ 'High',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'L-Very High Risk' ~ 'High',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'M-Very High Risk' ~ 'High',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'No Bureau History Available' ~ 'NoData',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'Not Scored: More than 50 active Accounts found' ~ 'OTHER',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'Not Scored: No Activity seen on the customer (Inactive)' ~ 'OTHER',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'Not Scored: No Updates available in last 36 months' ~ 'OTHER',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'Not Scored: Not Enough Info available on the customer' ~ 'OTHER',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'Not Scored: Only a Guarantor' ~ 'OTHER',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'Not Scored: Sufficient History Not Available' ~ 'OTHER'
+            )]
+
+prop.table(table(DT$PERFORM_CNS.SCORE.DESCRIPTION.new))
+DT[,PERFORM_CNS.SCORE.DESCRIPTION.new := factor(PERFORM_CNS.SCORE.DESCRIPTION.new,
+                                                levels = c("Low","Med","High","Other","NoData"),
+                                                ordered = TRUE)]
+
+
+DT[,PERFORM_CNS.SCORE.DESCRIPTION:=NULL]
+DT[,PERFORM_CNS.SCORE:=NULL]
+
+
+
+##################### NO OF ACCOUNTS  + NO OF INQUIRIES #####################
+
+#Convert them to factors
+
+temp <- grep(".ACCTS|NO.OF",names(DT),value=TRUE)
+lapply(DT[,temp,with=FALSE], function(x) round(prop.table(table(x)),3))
+
+group_category(data = DT, feature = "PRI.NO.OF.ACCTS", threshold = 0.25,update = TRUE)
+group_category(data = DT, feature = "PRI.ACTIVE.ACCTS", threshold = 0.1,update = TRUE)
+DT[,PRI.OVERDUE.ACCTS := as.character(if_else(PRI.OVERDUE.ACCTS >0,1,0))]
+
+DT[,SEC.NO.OF.ACCTS := as.character(if_else(SEC.NO.OF.ACCTS >0,1,0))]
+DT[,SEC.ACTIVE.ACCTS := as.character(if_else(SEC.ACTIVE.ACCTS >0,1,0))]
+DT[,SEC.OVERDUE.ACCTS := as.character(if_else(SEC.OVERDUE.ACCTS >0,1,0))]
+
+group_category(data = DT, feature = "NEW.ACCTS.IN.LAST.SIX.MONTHS", threshold = 0.04,update = TRUE)
+DT[,DELINQUENT.ACCTS.IN.LAST.SIX.MONTHS := as.character(if_else(DELINQUENT.ACCTS.IN.LAST.SIX.MONTHS >0,1,0))]
+DT[,NO.OF_INQUIRIES := as.character(if_else(NO.OF_INQUIRIES >0,1,0))]
+
+#Convert them to ordered factors
+DT[,(temp):=lapply(.SD,function(x) factor(x,ordered=TRUE)),.SDcols = temp]
+
+# A GLM Model 
+# ORDERED vs UNORDEREDFACTORS
+# A glm model only on these shows a difference based on how the factors are coded
+# TO bE INTERPRETED
+# Source : http://www.win-vector.com/blog/2012/07/modeling-trick-impact-coding-of-categorical-variables-with-many-levels/
+
+# temp_DT <- data.frame(lapply(DT[,c(temp,"loan_default"),with=FALSE],as.factor))
+# temp_model <-glm(loan_default~ .
+#                  ,data = temp_DT
+#                  ,family = binomial(link="logit"))
+# summary(temp_model)
+# 
+# temp_DT <- data.frame(lapply(DT[,c(temp,"loan_default"),with=FALSE],function(x) factor(x,ordered=TRUE)))
+# temp_model <-glm(loan_default~ .
+#                  ,data = temp_DT
+#                  ,family = binomial(link="logit"))
+# summary(temp_model)
+
+
+
+##################### the SIX Id columns  #####################
+
+fn_id_cols <- function(DT,col) {
+    
+    print(col)
+    print(eval(col))
+    by_cols <- c(col,"loan_default")
+    print(by_cols)
+    
+    temp <- DT[flag=="train",.(.N,disbursed_amount=as.numeric(sum(disbursed_amount))),by=by_cols][
+        ,.(loan_default,
+           tot_loans = sum(N),
+           tot_disbursed_amount =as.numeric(sum(disbursed_amount)),
+           avg_loan_amount=as.numeric(sum(disbursed_amount)/sum(N)),
+           default.pct = N/sum(N)),
+        by = col][loan_default == 1][order(tot_loans)]
+    
+    temp[,paste0(col,".default_rate") := cut(temp$default.pct, breaks=c(quantile(temp$default.pct, probs = seq(0, 1, by = 1/3))), 
+                                        labels=c("Low","Med","High"),include.lowest = TRUE
+                                        ,ordered = TRUE)]
+    
+    temp[,paste0(col,".volume") := cut(temp$tot_loans, breaks=c(quantile(temp$tot_loans, probs = seq(0, 1, by = 1/3))), 
+                                  labels=c("Low","Med","High"),include.lowest = TRUE
+                                  ,ordered = TRUE)]
+    
+    temp[,paste0(col,".avg_loan_amount") := cut(temp$avg_loan_amount, breaks=c(quantile(temp$avg_loan_amount, probs = seq(0, 1, by = 1/3))), 
+                                           labels=c("Low","Med","High"),include.lowest = TRUE
+                                           ,ordered = TRUE)]
+    
+    temp[,`:=`(loan_default=NULL,tot_loans=NULL,tot_disbursed_amount=NULL,avg_loan_amount=NULL,default.pct=NULL)]
+
+    temp
+}
+
+####### Branch ID #################
+temp <- fn_id_cols(DT,"branch_id")
+nrow(DT)
+DT <- merge(DT,temp,by="branch_id")
+nrow(DT)
+
+
+
+####### Supplier ID #################
+temp <- fn_id_cols(DT,"supplier_id")
+nrow(DT)
+DT <- merge(DT,temp,by="supplier_id",all.x = TRUE)
+nrow(DT)
+
+#Impute the NA values
+DT[is.na(supplier_id.default_rate),.(supplier_id.default_rate)] 
+temp <- names(which(prop.table(table(DT$supplier_id.default_rate)) == max(prop.table(table(DT$supplier_id.default_rate)))))
+DT[is.na(supplier_id.default_rate),supplier_id.default_rate:= (temp)] 
+DT[is.na(supplier_id.default_rate),.(supplier_id.default_rate)] 
+
+
+DT[is.na(supplier_id.volume),.(supplier_id.volume)] 
+temp <- names(which(prop.table(table(DT$supplier_id.volume)) == max(prop.table(table(DT$supplier_id.volume)))))
+DT[is.na(supplier_id.volume),supplier_id.volume:= (temp)] 
+DT[is.na(supplier_id.volume),.(supplier_id.volume)] 
+
+
+DT[is.na(supplier_id.avg_loan_amount),.(supplier_id.avg_loan_amount)] 
+temp <- names(which(prop.table(table(DT$supplier_id.avg_loan_amount)) == max(prop.table(table(DT$supplier_id.avg_loan_amount)))))
+DT[is.na(supplier_id.avg_loan_amount),supplier_id.avg_loan_amount:= (temp)] 
+DT[is.na(supplier_id.avg_loan_amount),.(supplier_id.avg_loan_amount)] 
+
+
+
+####### Manufacturer ID #################
+temp <- fn_id_cols(DT,"manufacturer_id")
+nrow(DT)
+DT <- merge(DT,temp,by="manufacturer_id",all.x = TRUE)
+nrow(DT)
+
+#Impute the NA values
+DT[is.na(manufacturer_id.default_rate),.(manufacturer_id.default_rate)] 
+temp <- names(which(prop.table(table(DT$manufacturer_id.default_rate)) == max(prop.table(table(DT$manufacturer_id.default_rate)))))
+DT[is.na(manufacturer_id.default_rate),manufacturer_id.default_rate:= (temp)] 
+DT[is.na(manufacturer_id.default_rate),.(manufacturer_id.default_rate)] 
+
+
+DT[is.na(manufacturer_id.volume),.(manufacturer_id.volume)] 
+temp <- names(which(prop.table(table(DT$manufacturer_id.volume)) == max(prop.table(table(DT$manufacturer_id.volume)))))
+DT[is.na(manufacturer_id.volume),manufacturer_id.volume:= (temp)] 
+DT[is.na(manufacturer_id.volume),.(manufacturer_id.volume)] 
+
+
+DT[is.na(manufacturer_id.avg_loan_amount),.(manufacturer_id.avg_loan_amount)] 
+temp <- names(which(prop.table(table(DT$manufacturer_id.avg_loan_amount)) == max(prop.table(table(DT$manufacturer_id.avg_loan_amount)))))
+DT[is.na(manufacturer_id.avg_loan_amount),manufacturer_id.avg_loan_amount:= (temp)] 
+DT[is.na(manufacturer_id.avg_loan_amount),.(manufacturer_id.avg_loan_amount)] 
+
+
+
+####### Employee_code_ID #################
+temp <- fn_id_cols(DT,"Employee_code_ID")
+nrow(DT)
+DT <- merge(DT,temp,by="Employee_code_ID",all.x = TRUE)
+nrow(DT)
+
+#Impute the NA values
+DT[is.na(Employee_code_ID.default_rate),.(Employee_code_ID.default_rate)] 
+temp <- names(which(prop.table(table(DT$Employee_code_ID.default_rate)) == max(prop.table(table(DT$Employee_code_ID.default_rate)))))
+DT[is.na(Employee_code_ID.default_rate),Employee_code_ID.default_rate:= (temp)] 
+DT[is.na(Employee_code_ID.default_rate),.(Employee_code_ID.default_rate)] 
+
+
+DT[is.na(Employee_code_ID.volume),.(Employee_code_ID.volume)] 
+temp <- names(which(prop.table(table(DT$Employee_code_ID.volume)) == max(prop.table(table(DT$Employee_code_ID.volume)))))
+DT[is.na(Employee_code_ID.volume),Employee_code_ID.volume:= (temp)] 
+DT[is.na(Employee_code_ID.volume),.(Employee_code_ID.volume)] 
+
+
+DT[is.na(Employee_code_ID.avg_loan_amount),.(Employee_code_ID.avg_loan_amount)] 
+temp <- names(which(prop.table(table(DT$Employee_code_ID.avg_loan_amount)) == max(prop.table(table(DT$Employee_code_ID.avg_loan_amount)))))
+DT[is.na(Employee_code_ID.avg_loan_amount),Employee_code_ID.avg_loan_amount:= (temp)] 
+DT[is.na(Employee_code_ID.avg_loan_amount),.(Employee_code_ID.avg_loan_amount)] 
+
+
+
+####### State_ID  #################
+temp <- fn_id_cols(DT,"State_ID")
+nrow(DT)
+DT <- merge(DT,temp,by="State_ID")
+nrow(DT)
+
+
+####### Current_pincode_ID  #################
+temp <- fn_id_cols(DT,"Current_pincode_ID")
+nrow(DT)
+DT <- merge(DT,temp,by="Current_pincode_ID",all.x = TRUE)
+nrow(DT)
+
+#Impute the NA values
+DT[is.na(Current_pincode_ID.default_rate),.(Current_pincode_ID.default_rate)] 
+temp <- names(which(prop.table(table(DT$Current_pincode_ID.default_rate)) == max(prop.table(table(DT$Current_pincode_ID.default_rate)))))
+temp
+DT[is.na(Current_pincode_ID.default_rate),Current_pincode_ID.default_rate:= (temp)] 
+DT[is.na(Current_pincode_ID.default_rate),.(Current_pincode_ID.default_rate)] 
+
+
+DT[is.na(Current_pincode_ID.volume),.(Current_pincode_ID.volume)] 
+temp <- names(which(prop.table(table(DT$Current_pincode_ID.volume)) == max(prop.table(table(DT$Current_pincode_ID.volume)))))
+temp
+DT[is.na(Current_pincode_ID.volume),Current_pincode_ID.volume:= (temp)] 
+DT[is.na(Current_pincode_ID.volume),.(Current_pincode_ID.volume)] 
+
+
+DT[is.na(Current_pincode_ID.avg_loan_amount),.(Current_pincode_ID.avg_loan_amount)] 
+temp <- names(which(prop.table(table(DT$Current_pincode_ID.avg_loan_amount)) == max(prop.table(table(DT$Current_pincode_ID.avg_loan_amount)))))
+temp
+DT[is.na(Current_pincode_ID.avg_loan_amount),Current_pincode_ID.avg_loan_amount:= (temp)] 
+DT[is.na(Current_pincode_ID.avg_loan_amount),.(Current_pincode_ID.avg_loan_amount)] 
+
+
+#drop the id features
+temp <- c("branch_id","supplier_id","Current_pincode_ID","State_ID","Employee_code_ID","manufacturer_id")
+DT[,(temp) := NULL]
+
+
+
+##############################################
+#########   BRING BACK THE AMOUNTS ###########
+##############################################
+
+#Earlier code that was deleting it
+#temp <- grep("PRI|SEC|PRIMARY|disbursed_amount|asset_cost",
+#     names(DT),value = TRUE)
+#DT[,(temp):=NULL]
+
+
+temp <- grep("PRI|SEC|PRIMARY",names(DT),value = TRUE)
+
+#plot_histogram(DT[,(temp),with = FALSE])
+
+DT[,PRI.CURRENT.BALANCE.bin := as.character(if_else(PRI.CURRENT.BALANCE >0,1,0))]
+DT[,PRI.DISBURSED.AMOUNT.bin := as.character(if_else(PRI.DISBURSED.AMOUNT >0,1,0))]
+DT[,PRI.SANCTIONED.AMOUNT.bin := as.character(if_else(PRI.SANCTIONED.AMOUNT >0,1,0))]
+DT[,PRIMARY.INSTAL.AMT.bin := as.character(if_else(PRIMARY.INSTAL.AMT >0,1,0))]
+
+
+DT[,SEC.CURRENT.BALANCE.bin := as.character(if_else(SEC.CURRENT.BALANCE >0,1,0))]
+DT[,SEC.DISBURSED.AMOUNT.bin := as.character(if_else(SEC.DISBURSED.AMOUNT >0,1,0))]
+DT[,SEC.SANCTIONED.AMOUNT.bin := as.character(if_else(SEC.SANCTIONED.AMOUNT >0,1,0))]
+DT[,SEC.INSTAL.AMT.bin := as.character(if_else(SEC.INSTAL.AMT >0,1,0))]
+
+#Convert the above bins to factors
+temp <- names(which(lapply(DT,is.character)==TRUE))
+DT[,(temp) := lapply(.SD, as.factor) , .SDcols = (temp)]
+
+# #Convert ordered to unordered on some features
+# temp <- names(which(lapply(DT,is.ordered)==TRUE))[1:9]
+# temp <- c()
+# DT[,(temp) := lapply(.SD,function(x) factor(x,ordered = FALSE)), .SDcols = temp]
+
+
+
+################## Work the Numeric features ###############
+
+which(lapply(DT, is.numeric)==TRUE)
+
+DT[,PRI.CURRENT.BALANCE := PRI.CURRENT.BALANCE + SEC.CURRENT.BALANCE]
+DT[,SEC.CURRENT.BALANCE := NULL]
+
+DT[,PRI.SANCTIONED.AMOUNT := PRI.SANCTIONED.AMOUNT + SEC.SANCTIONED.AMOUNT]
+DT[,SEC.SANCTIONED.AMOUNT := NULL]
+
+DT[,PRIMARY.INSTAL.AMT := PRIMARY.INSTAL.AMT + SEC.INSTAL.AMT]
+DT[,SEC.INSTAL.AMT := NULL]
+
+DT[,PRI.DISBURSED.AMOUNT := PRI.DISBURSED.AMOUNT + SEC.DISBURSED.AMOUNT]
+DT[,SEC.DISBURSED.AMOUNT := NULL]
+
+#some ratios
+DT[,asset_cost_ratio := asset_cost / disbursed_amount ]
+DT[,ltv_asset_cost_ratio := asset_cost / ltv ]
+DT[,ltv_disbursed_amount_ratio := disbursed_amount / ltv ]
+
+
+
+################# Polynomials ##################
+
+# nos <- 5
+# temp <- data.frame(poly(DT$ltv,nos))
+# colnames(temp) <- paste0("ltv",seq(1,nos,1))
+# DT <- cbind(DT,temp)
+# 
+# temp <- data.frame(poly(DT$asset_cost,nos))
+# colnames(temp) <- paste0("asset_cost",seq(1,nos,1))
+# DT <- cbind(DT,temp)
+
+
+
+##################### BOX COX  #####################
+#Box Cox transformation of numeric columns
+
+# temp <-names(which(lapply(DT,is.numeric)==TRUE))
+# 
+# preProcValues <- preProcess(DT[,(temp),with = FALSE], method = "BoxCox")
+# DT_tran <- predict(preProcValues, DT[,(temp),with = FALSE])
+# 
+# #remove the columns from DT and cbind the transformed columns
+# DT[,(temp) := NULL]
+# 
+# DT <- cbind(DT,DT_tran)
+# 
+# rm(DT_tran)
+# rm(preProcValues)
+
+
+
+
+##################################################
+########       Fix the data Leakage      #########
+##################################################
+
+temp <- grep("default",names(DT),value = TRUE)
+temp <- temp[-grep("loan_default",temp)]
+DT[,(temp):=NULL]
+
+
+##################################################
+####### High continuous correlated       #########
+##################################################
+
+#plot_correlation(DT,type = "continuous")
+
+# DT[,SEC.DISBURSED.AMOUNT:= NULL]
+# DT[,disbursed_amount := NULL]
+# DT[,SEC.SANCTIONED.AMOUNT := NULL]
+# DT[,PRI.SANCTIONED.AMOUNT := NULL]
+
+
+
+##################################################
+#######       Remove the FLAG           #########
+##################################################
+
+DT$flag <- NULL
+
+vars <- c("Employment.Type", "Aadhar_flag","PAN_flag","VoterID_flag","Driving_flag","Passport_flag"
+          ,"DELINQUENT.ACCTS.IN.LAST.SIX.MONTHS","NO.OF_INQUIRIES", "age.today",
+          "PERFORM_CNS.SCORE.DESCRIPTION.new", "PRI.CURRENT.BALANCE.bin","PRIMARY.INSTAL.AMT.bin",
+          "ltv","PRI.CURRENT.BALANCE","PRIMARY.INSTAL.AMT","loan_default")
+
+
+
+#DT <- DT[,(vars),with=FALSE]
+
+
+###########################################################
+#######       Change ORDERED to UNORDERED         #########
+###########################################################
+
+str(DT)
+temp <- names(which(lapply(DT,is.ordered) == TRUE))
+temp
+DT[, (temp) := lapply(.SD, function(x) as.factor(as.character(x))), .SDcols = temp]
+
+
+```
+
+
+### Model Data Prep
+```{r}
+
+index <- createDataPartition(y=DT$loan_default, p=0.8
+                             , list=FALSE) 
+my_train <- DT[index,]
+my_test <- DT[-index,]
+
+
+my_train_labels <- my_train$loan_default
+my_train$loan_default <- NULL
+
+my_test_labels <- my_test$loan_default 
+my_test$loan_default <- NULL
+
+dummies <- dummyVars(~., data = my_train, fullRank = TRUE)
+my_train <- predict(dummies, newdata = my_train)
+
+dummies <- dummyVars(~., data = my_test,fullRank = TRUE)
+my_test <- predict(dummies, newdata = my_test)
+
+
+my_train <- xgb.DMatrix(my_train, label = my_train_labels)
+my_test <- xgb.DMatrix(my_test, label = my_test_labels)
+
+watchlist <- list(test = my_test, train = my_train)
+
+
+```
+
+
+### Bayesian Optimisation
+```{r}
+opt_fn <- function(nrounds, eta, max_depth,gamma) {
+    
+    xgb_model <- xgb.train(
+        params = list(
+            booster = "gbtree"
+            ,objective = "binary:logistic"
+            ,eval_metric = "auc"
+            ,eta = eta
+            ,max_depth=max_depth
+            ,gamma = gamma)
+    ,data = my_train
+    ,watchlist = watchlist
+    ,nrounds = nrounds
+    ,early_stopping_rounds = 10
+    ,verbose = TRUE
+    ,prediction = TRUE) 
+    
+    list(
+        #Score = xgb_model$best_score
+        Score = xgb_model$evaluation_log[xgb_model$best_iteration]$test_auc
+        ,Pred = xgb_model$pred)
+  
+}
+
+
+opt_res <- BayesianOptimization(opt_fn
+                                ,bounds = list(
+                                    nrounds = c(50,300)
+                                    ,eta = c(0.0001,1)
+                                    ,max_depth = c(4L,8L)
+                                    ,gamma = c(0,50))
+                                ,init_grid_dt = NULL
+                                ,init_points = 10
+                                ,n_iter = 50
+                                ,acq = "ucb"
+                                ,kappa = 2.576
+                                ,eps = 0.0
+                                ,verbose = TRUE)
+
+
+
+#  Best Parameters Found: 
+# Round = 20	nrounds = 149.5553	eta = 0.1680	max_depth = 7.0000	gamma = 14.6431	Value = 0.6522 
+
+# elapsed = 7.16	Round = 5	nrounds = 286.3347	eta = 0.4040	max_depth = 6.0000	gamma = 25.3421	Value = 0.6497 
+# elapsed = 34.88	Round = 60	nrounds = 86.2078	eta = 0.0929	max_depth = 7.0000	gamma = 0.0000	Value = 0.6516 
+# elapsed = 16.94	Round = 73	nrounds = 500.0000	eta = 0.1028	max_depth = 5.0000	gamma = 18.7949	Value = 0.6510 
+# elapsed = 18.61	Round = 80	nrounds = 222.9636	eta = 0.1366	max_depth = 7.0000	gamma = 7.9687	Value = 0.6525 
+
+
+```
+
+
+### Predict and Evaluate
+```{r}
+
+xgb_model <- xgb.train(
+    params = list(
+        booster = "gbtree"
+        ,objective = "binary:logistic"
+        ,eval_metric = "auc"
+        ,eta = 0.137
+        ,max_depth=7
+        ,gamma = 7.97)
+,data = my_train
+,watchlist = watchlist
+,nrounds = 223
+,early_stopping_rounds = 10
+,verbose = TRUE
+,prediction = TRUE) 
+
+
+# Learning Curve
+ggplot(melt(xgb_model$evaluation_log,id.vars = "iter")) +
+    geom_line(aes(x=iter, y=value, color=variable))
+
+importance <- xgb.importance(model = xgb_model)
+importance
+xgb.plot.importance(importance)
+
+
+pred <- predict(xgb_model,newdata = my_test)
+summary(pred)
+
+#ROC Curves to find the optimal cutoff 
+p_load(PRROC)
+fg <- pred[my_test_labels == 1]
+bg <- pred[my_test_labels == 0]
+roc <- roc.curve(scores.class0 = fg, scores.class1 = bg, curve = T)
+plot(roc)
+pr <- pr.curve(scores.class0 = fg, scores.class1 = bg, curve = T)
+plot(pr)
+
+prob_pred <- ifelse(pred > 0.3288902,1,0)
+prop.table(table(prob_pred))
+
+confusionMatrix(factor(prob_pred),factor(my_test_labels))
+
+
+
+# Other XGB plots [TO BE REVIEWED]
+#xgb.plot.multi.trees(model = xgb_model)
+#xgb.plot.deepness(model=xgb_model)
+#xgb.plot.shap()
+#xgb.plot.tree(model=xgb_model)
+
+
+# Feature contributions [HOW CAN THIS BE USED]
+#pred <- predict(xgb_model,newdata = my_test ,predcontrib = TRUE)
+
+
+
+```
+
+
+
+
+### Submission
+```{r}
+
+####################################################
+##########           Submission           ##########
+####################################################
+
+pred <- predict(xgb_model,newdata = my_test)
+summary(pred)
+prob_pred <- ifelse(pred > 0.5,1,0)
+prop.table(table(prob_pred))
+
+
+get_unique_ids <- fread(here::here("100_data_raw-input","test.csv"))
+
+submit_kaggle <- as.data.frame(cbind(get_unique_ids$UniqueID,pred))
+colnames(submit_kaggle) <- c("UniqueID","loan_default")
+
+write.csv(submit_kaggle
+          ,file = here("120_data_output"
+                       ,paste0("Submit_XGB_",strftime(Sys.time(), format="%Y%m%d_%H%M%S"),".csv"))
+          ,row.names = FALSE)
+
+
+```
+
+
+
+Misc Code and Notes
+
+```{r}
+
+
+
+####################################################
+##########             Notes              ##########
+####################################################
+
+#XGB recognizes that many of your features are not important and didn't use them in the process of building decision trees. 
+#You can force XGB to use all of them by increasing max tree depth setting, but you are overfitting the data this way.
+
+#https://www.kaggle.com/c/santander-customer-satisfaction/discussion/20662
+#https://www.analyticsvidhya.com/blog/2016/03/complete-guide-parameter-tuning-xgboost-with-codes-python/
+#https://xgboost.readthedocs.io/en/latest/parameter.html
+
+
+
+temp <-names(which(lapply(test,is.factor)==TRUE))
+
+dummies <- dummyVars(~., data = test[,(temp),with=FALSE])
+test_factors <-  as.data.frame(predict(dummies, newdata = test[,(temp),with=FALSE]))
+
+
+head(test_factors)
+
+test[,(temp):=NULL]
+test <- data.matrix(cbind(test,test_factors))
+
+
+#Good explanation .. this one made me icnrease the number of trees
+#https://stats.stackexchange.com/questions/204489/discussion-about-overfit-in-xgboost
+#http://www.stat.columbia.edu/~jakulin/Int/
+    
+
+#Examples
+#https://www.kaggle.com/aniruddhachakraborty/lasso-gbm-xgboost-top-20-0-12039-using-r
+#https://www.kaggle.com/serigne/stacked-regressions-top-4-on-leaderboard
+#https://www.kaggle.com/jingfengzhu/machine-learning-with-xgboost-in-r-workbook
+
+
+### Increasing the scale_pos_weight to 20, increased the probabilities as below
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#0.2668  0.6703  0.7480  0.7211  0.7961  0.8428 
+# Indicating that higher weight was put on the positive observations
+# Confusion Matrix and Statistics (for p>0.5)
+#               Reference
+# Prediction     0     1
+#           0  1581    82
+#           1 34791 10176
+
+#Reducing it to 5, did not change much and also reduing the max_depth from 15 to 5 did not change anything
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#0.2942  0.4631  0.5425  0.5393  0.6201  0.7500 
+# Confusion Matrix and Statistics
+#               Reference
+# Prediction     0     1
+#               0 15126  1752
+#               1 21246  8506
+
+
+
+#### OPTIMAL CUTPOINTS #####
+
+
+opt_cut <- cutpointr::cutpointr(x=predicted,
+                                    class=actual_loan_defaults,
+                                
+                                    method = maximize_metric,
+                                    #metric = F1_score,
+                                    metric = cohens_kappa,
+                                    direction = ">=",
+                                    pos_class = 1)
+plot(opt_cut)
+plot_metric(opt_cut)
+
+
+```
+
+
+
+Few things to try
+1. With Unordered, Box Cox, and polynomials of ltv/assetcost
+
+Best Parameters Found: 
+Round = 54	nrounds = 96.6397	eta = 0.0919	max_depth = 8.0000	gamma = 10.5473	Value = 0.6549 
+
+elapsed = 8.59	Round = 1	nrounds = 257.8914	eta = 0.4610	max_depth = 5.0000	gamma = 37.1986	Value = 0.6392 
+elapsed = 37.94	Round = 2	nrounds = 95.8367	eta = 0.8235	max_depth = 6.0000	gamma = 5.5203	Value = 0.6270 
+elapsed = 14.61	Round = 3	nrounds = 214.7087	eta = 0.3365	max_depth = 5.0000	gamma = 16.9480	Value = 0.6498 
+elapsed = 21.76	Round = 4	nrounds = 214.4389	eta = 0.5415	max_depth = 6.0000	gamma = 5.2044	Value = 0.6443 
+elapsed = 15.52	Round = 5	nrounds = 162.0396	eta = 0.1546	max_depth = 5.0000	gamma = 36.3546	Value = 0.6415 
+elapsed = 17.05	Round = 6	nrounds = 263.9668	eta = 0.4338	max_depth = 5.0000	gamma = 8.6289	Value = 0.6511 
+elapsed = 7.92	Round = 7	nrounds = 201.4688	eta = 0.6581	max_depth = 5.0000	gamma = 31.4582	Value = 0.6417 
+elapsed = 10.76	Round = 8	nrounds = 55.9001	eta = 0.2642	max_depth = 5.0000	gamma = 44.4196	Value = 0.6404 
+elapsed = 6.87	Round = 9	nrounds = 184.4832	eta = 0.8893	max_depth = 5.0000	gamma = 39.2320	Value = 0.6388 
+elapsed = 7.16	Round = 10	nrounds = 288.3516	eta = 0.9175	max_depth = 5.0000	gamma = 21.6163	Value = 0.6420 
+elapsed = 50.93	Round = 11	nrounds = 151.5447	eta = 0.0832	max_depth = 5.0000	gamma = 4.5275	Value = 0.6542 
+elapsed = 2.90	Round = 12	nrounds = 187.0813	eta = 0.0001	max_depth = 4.0000	gamma = 0.0000	Value = 0.6058 
+elapsed = 18.44	Round = 13	nrounds = 300.0000	eta = 0.1365	max_depth = 6.0000	gamma = 47.4893	Value = 0.6403 
+elapsed = 50.01	Round = 14	nrounds = 267.8515	eta = 0.4738	max_depth = 5.0000	gamma = 2.7365	Value = 0.6424 
+elapsed = 8.66	Round = 15	nrounds = 110.7429	eta = 0.6225	max_depth = 5.0000	gamma = 8.9797	Value = 0.6455 
+elapsed = 4.39	Round = 16	nrounds = 168.6395	eta = 0.0001	max_depth = 6.0000	gamma = 13.1191	Value = 0.6157 
+elapsed = 8.98	Round = 17	nrounds = 230.1418	eta = 0.4396	max_depth = 5.0000	gamma = 29.3743	Value = 0.6435 
+elapsed = 69.36	Round = 18	nrounds = 206.0223	eta = 0.0630	max_depth = 5.0000	gamma = 7.3117	Value = 0.6547 
+elapsed = 117.25	Round = 19	nrounds = 300.0000	eta = 0.8403	max_depth = 6.0000	gamma = 0.0000	Value = 0.6011 
+elapsed = 28.44	Round = 20	nrounds = 84.4870	eta = 0.0221	max_depth = 5.0000	gamma = 29.0397	Value = 0.6318 
+elapsed = 9.53	Round = 21	nrounds = 70.3409	eta = 0.5859	max_depth = 6.0000	gamma = 22.9741	Value = 0.6465 
+elapsed = 59.66	Round = 22	nrounds = 300.0000	eta = 0.0969	max_depth = 5.0000	gamma = 4.6371	Value = 0.6542 
+elapsed = 11.70	Round = 23	nrounds = 120.1348	eta = 0.6735	max_depth = 7.0000	gamma = 14.9940	Value = 0.6457 
+elapsed = 2.89	Round = 24	nrounds = 136.8195	eta = 0.0001	max_depth = 4.0000	gamma = 45.2815	Value = 0.6047 
+elapsed = 7.97	Round = 25	nrounds = 108.9228	eta = 1.0000	max_depth = 7.0000	gamma = 35.9701	Value = 0.6378 
+elapsed = 7.73	Round = 26	nrounds = 196.2187	eta = 1.0000	max_depth = 6.0000	gamma = 50.0000	Value = 0.6363 
+elapsed = 12.08	Round = 27	nrounds = 65.0876	eta = 0.8653	max_depth = 8.0000	gamma = 20.3328	Value = 0.6461 
+elapsed = 16.07	Round = 28	nrounds = 214.8930	eta = 0.2992	max_depth = 8.0000	gamma = 30.0791	Value = 0.6435 
+elapsed = 8.76	Round = 29	nrounds = 89.1598	eta = 0.4142	max_depth = 5.0000	gamma = 21.5322	Value = 0.6467 
+elapsed = 29.74	Round = 30	nrounds = 56.5631	eta = 0.3276	max_depth = 8.0000	gamma = 7.3278	Value = 0.6460 
+elapsed = 154.16	Round = 31	nrounds = 288.6223	eta = 1.0000	max_depth = 8.0000	gamma = 0.0000	Value = 0.5825 
+elapsed = 8.32	Round = 32	nrounds = 53.4085	eta = 1.0000	max_depth = 8.0000	gamma = 50.0000	Value = 0.6338 
+elapsed = 6.75	Round = 33	nrounds = 251.1328	eta = 0.0001	max_depth = 8.0000	gamma = 15.8041	Value = 0.6224 
+elapsed = 6.30	Round = 34	nrounds = 96.7306	eta = 0.0001	max_depth = 8.0000	gamma = 50.0000	Value = 0.6108 
+elapsed = 11.50	Round = 35	nrounds = 130.7355	eta = 0.7282	max_depth = 8.0000	gamma = 34.2600	Value = 0.6414 
+elapsed = 5.49	Round = 36	nrounds = 230.2568	eta = 1.0000	max_depth = 4.0000	gamma = 33.2546	Value = 0.6381 
+elapsed = 13.99	Round = 37	nrounds = 86.7852	eta = 0.5031	max_depth = 8.0000	gamma = 19.0669	Value = 0.6492 
+elapsed = 41.88	Round = 38	nrounds = 286.7688	eta = 0.0884	max_depth = 8.0000	gamma = 22.9458	Value = 0.6476 
+elapsed = 7.88	Round = 39	nrounds = 300.0000	eta = 0.5070	max_depth = 6.0000	gamma = 49.5778	Value = 0.6381 
+elapsed = 16.81	Round = 40	nrounds = 266.4551	eta = 0.2397	max_depth = 4.0000	gamma = 6.9415	Value = 0.6518 
+elapsed = 6.31	Round = 41	nrounds = 154.4083	eta = 1.0000	max_depth = 4.0000	gamma = 13.8422	Value = 0.6401 
+elapsed = 7.14	Round = 42	nrounds = 173.4250	eta = 0.2858	max_depth = 4.0000	gamma = 50.0000	Value = 0.6374 
+elapsed = 6.84	Round = 43	nrounds = 300.0000	eta = 0.5221	max_depth = 5.0000	gamma = 44.3956	Value = 0.6392 
+elapsed = 5.36	Round = 44	nrounds = 190.2163	eta = 1.0000	max_depth = 4.0000	gamma = 44.7508	Value = 0.6367 
+elapsed = 7.50	Round = 45	nrounds = 50.0000	eta = 1.0000	max_depth = 6.0000	gamma = 26.2738	Value = 0.6416 
+elapsed = 10.07	Round = 46	nrounds = 300.0000	eta = 0.4866	max_depth = 5.0000	gamma = 13.5933	Value = 0.6497 
+elapsed = 31.40	Round = 47	nrounds = 102.0352	eta = 0.0001	max_depth = 6.0000	gamma = 5.8147	Value = 0.6155 
+elapsed = 8.16	Round = 48	nrounds = 50.0000	eta = 0.9322	max_depth = 4.0000	gamma = 17.0566	Value = 0.6439 
+elapsed = 6.66	Round = 49	nrounds = 292.2990	eta = 0.7774	max_depth = 4.0000	gamma = 19.3516	Value = 0.6449 
+elapsed = 12.42	Round = 50	nrounds = 116.8054	eta = 0.2167	max_depth = 4.0000	gamma = 19.6202	Value = 0.6471 
+elapsed = 11.04	Round = 51	nrounds = 130.7254	eta = 0.6661	max_depth = 8.0000	gamma = 50.0000	Value = 0.6396 
+elapsed = 4.79	Round = 52	nrounds = 101.8776	eta = 0.7933	max_depth = 4.0000	gamma = 50.0000	Value = 0.6358 
+elapsed = 22.04	Round = 53	nrounds = 67.3377	eta = 0.1473	max_depth = 5.0000	gamma = 10.2505	Value = 0.6529 
+elapsed = 53.82	Round = 54	nrounds = 96.6397	eta = 0.0919	max_depth = 8.0000	gamma = 10.5473	Value = 0.6549 
+elapsed = 45.32	Round = 55	nrounds = 172.1325	eta = 0.3387	max_depth = 4.0000	gamma = 0.0000	Value = 0.6500 
+elapsed = 17.09	Round = 56	nrounds = 57.3087	eta = 0.1002	max_depth = 4.0000	gamma = 17.6130	Value = 0.6442 
+elapsed = 28.15	Round = 57	nrounds = 300.0000	eta = 0.1297	max_depth = 5.0000	gamma = 12.7051	Value = 0.6521 
+elapsed = 58.44	Round = 58	nrounds = 115.8119	eta = 0.6763	max_depth = 8.0000	gamma = 0.0000	Value = 0.6087 
+elapsed = 13.60	Round = 59	nrounds = 143.9213	eta = 0.5768	max_depth = 8.0000	gamma = 14.0434	Value = 0.6474 
+elapsed = 26.85	Round = 60	nrounds = 247.1232	eta = 0.2414	max_depth = 8.0000	gamma = 13.7682	Value = 0.6536 
+
+
+2. With Ordered, NO Box Cox, and NO polynomials of ltv/assetcost
+
+ Best Parameters Found: 
+Round = 40	nrounds = 289.9249	eta = 0.0779	max_depth = 6.0000	gamma = 6.6549	Value = 0.6553 
+
+elapsed = 15.46	Round = 3	nrounds = 51.9283	eta = 0.3789	max_depth = 7.0000	gamma = 9.3120	Value = 0.6481 
+elapsed = 11.55	Round = 4	nrounds = 296.0790	eta = 0.4543	max_depth = 7.0000	gamma = 10.8668	Value = 0.6499 
+elapsed = 4.82	Round = 5	nrounds = 228.4993	eta = 0.9803	max_depth = 5.0000	gamma = 42.8227	Value = 0.6380 
+elapsed = 53.22	Round = 6	nrounds = 150.3891	eta = 0.0115	max_depth = 6.0000	gamma = 16.7786	Value = 0.6345 
+elapsed = 33.68	Round = 7	nrounds = 214.0813	eta = 0.4957	max_depth = 5.0000	gamma = 3.5198	Value = 0.6425 
+elapsed = 6.74	Round = 8	nrounds = 126.1239	eta = 0.9461	max_depth = 7.0000	gamma = 35.4614	Value = 0.6384 
+elapsed = 9.97	Round = 9	nrounds = 205.2551	eta = 0.2765	max_depth = 5.0000	gamma = 28.8465	Value = 0.6461 
+elapsed = 6.05	Round = 10	nrounds = 246.9373	eta = 0.9882	max_depth = 5.0000	gamma = 15.8979	Value = 0.6414 
+elapsed = 3.71	Round = 11	nrounds = 50.0000	eta = 1.0000	max_depth = 4.0000	gamma = 49.9687	Value = 0.6343 
+elapsed = 10.20	Round = 12	nrounds = 198.5207	eta = 0.1771	max_depth = 4.0000	gamma = 47.5250	Value = 0.6386 
+elapsed = 17.60	Round = 13	nrounds = 52.3617	eta = 0.6897	max_depth = 6.0000	gamma = 0.4551	Value = 0.6344 
+elapsed = 6.77	Round = 14	nrounds = 282.3188	eta = 0.5363	max_depth = 5.0000	gamma = 19.2320	Value = 0.6467 
+elapsed = 10.18	Round = 15	nrounds = 50.0000	eta = 0.0001	max_depth = 8.0000	gamma = 0.0000	Value = 0.6221 
+elapsed = 87.36	Round = 16	nrounds = 300.0000	eta = 0.2527	max_depth = 5.0000	gamma = 0.0000	Value = 0.6461 
+elapsed = 87.58	Round = 17	nrounds = 254.7343	eta = 0.4714	max_depth = 6.0000	gamma = 1.2451	Value = 0.6249 
+elapsed = 8.80	Round = 18	nrounds = 111.7646	eta = 0.5805	max_depth = 7.0000	gamma = 42.8333	Value = 0.6430 
+elapsed = 11.86	Round = 19	nrounds = 76.1454	eta = 0.2279	max_depth = 6.0000	gamma = 19.1050	Value = 0.6478 
+elapsed = 9.06	Round = 20	nrounds = 244.2045	eta = 0.9502	max_depth = 7.0000	gamma = 15.3591	Value = 0.6455 
+elapsed = 9.97	Round = 21	nrounds = 151.4166	eta = 0.6231	max_depth = 8.0000	gamma = 49.2988	Value = 0.6432 
+elapsed = 6.00	Round = 22	nrounds = 82.1006	eta = 0.7346	max_depth = 5.0000	gamma = 21.7006	Value = 0.6451 
+elapsed = 24.28	Round = 23	nrounds = 206.6001	eta = 0.1745	max_depth = 6.0000	gamma = 10.2847	Value = 0.6531 
+elapsed = 8.78	Round = 24	nrounds = 183.3207	eta = 0.8450	max_depth = 8.0000	gamma = 27.9418	Value = 0.6405 
+elapsed = 9.50	Round = 25	nrounds = 237.0552	eta = 0.3731	max_depth = 5.0000	gamma = 22.4811	Value = 0.6488 
+elapsed = 19.07	Round = 26	nrounds = 287.3960	eta = 0.1901	max_depth = 6.0000	gamma = 9.8541	Value = 0.6534 
+elapsed = 10.75	Round = 27	nrounds = 104.7056	eta = 0.3453	max_depth = 5.0000	gamma = 19.1218	Value = 0.6490 
+elapsed = 10.23	Round = 28	nrounds = 218.9120	eta = 0.6782	max_depth = 8.0000	gamma = 31.1315	Value = 0.6450 
+elapsed = 6.26	Round = 29	nrounds = 79.5912	eta = 0.7805	max_depth = 5.0000	gamma = 32.5191	Value = 0.6423 
+elapsed = 39.69	Round = 30	nrounds = 250.0702	eta = 0.0493	max_depth = 6.0000	gamma = 28.1256	Value = 0.6450 
+elapsed = 15.27	Round = 31	nrounds = 249.5119	eta = 0.1478	max_depth = 6.0000	gamma = 31.4203	Value = 0.6442 
+elapsed = 14.08	Round = 32	nrounds = 101.1624	eta = 0.5082	max_depth = 7.0000	gamma = 9.6847	Value = 0.6484 
+elapsed = 7.61	Round = 33	nrounds = 75.1066	eta = 0.5209	max_depth = 5.0000	gamma = 32.2591	Value = 0.6452 
+elapsed = 30.71	Round = 34	nrounds = 221.4594	eta = 0.1865	max_depth = 6.0000	gamma = 4.5278	Value = 0.6526 
+elapsed = 16.88	Round = 35	nrounds = 76.9979	eta = 0.2387	max_depth = 6.0000	gamma = 9.1406	Value = 0.6520 
+elapsed = 18.63	Round = 36	nrounds = 212.6322	eta = 0.1835	max_depth = 6.0000	gamma = 14.5005	Value = 0.6511 
+elapsed = 21.87	Round = 37	nrounds = 99.4931	eta = 0.1861	max_depth = 6.0000	gamma = 8.4388	Value = 0.6535 
+elapsed = 32.26	Round = 38	nrounds = 219.2530	eta = 0.1830	max_depth = 6.0000	gamma = 9.3987	Value = 0.6541 
+elapsed = 20.77	Round = 39	nrounds = 172.7546	eta = 0.2109	max_depth = 6.0000	gamma = 9.6314	Value = 0.6525 
+elapsed = 60.28	Round = 40	nrounds = 289.9249	eta = 0.0779	max_depth = 6.0000	gamma = 6.6549	Value = 0.6553 
+elapsed = 26.30	Round = 41	nrounds = 262.5002	eta = 0.1332	max_depth = 6.0000	gamma = 6.9576	Value = 0.6541 
+elapsed = 101.11	Round = 42	nrounds = 282.5105	eta = 0.0189	max_depth = 6.0000	gamma = 9.2955	Value = 0.6511 
+elapsed = 46.24	Round = 43	nrounds = 298.4112	eta = 0.0987	max_depth = 7.0000	gamma = 8.8819	Value = 0.6541 
+elapsed = 67.03	Round = 44	nrounds = 280.9153	eta = 0.0637	max_depth = 5.0000	gamma = 4.1753	Value = 0.6542 
+elapsed = 10.11	Round = 45	nrounds = 272.0685	eta = 0.4105	max_depth = 5.0000	gamma = 7.8267	Value = 0.6485 
+elapsed = 49.72	Round = 46	nrounds = 297.4615	eta = 0.1910	max_depth = 5.0000	gamma = 3.3552	Value = 0.6521 
+elapsed = 12.62	Round = 47	nrounds = 233.8038	eta = 0.3834	max_depth = 7.0000	gamma = 14.7253	Value = 0.6493 
+elapsed = 10.14	Round = 48	nrounds = 285.0418	eta = 0.7394	max_depth = 7.0000	gamma = 13.4295	Value = 0.6454 
+elapsed = 14.60	Round = 49	nrounds = 280.9891	eta = 0.6503	max_depth = 5.0000	gamma = 5.5999	Value = 0.6436 
+elapsed = 95.34	Round = 50	nrounds = 193.9142	eta = 0.0233	max_depth = 8.0000	gamma = 12.4567	Value = 0.6509 
+elapsed = 9.78	Round = 51	nrounds = 108.7780	eta = 0.9793	max_depth = 7.0000	gamma = 12.3016	Value = 0.6383 
+elapsed = 9.74	Round = 52	nrounds = 161.4668	eta = 0.7484	max_depth = 7.0000	gamma = 16.2735	Value = 0.6470 
+elapsed = 16.11	Round = 53	nrounds = 219.0428	eta = 0.1562	max_depth = 5.0000	gamma = 22.4223	Value = 0.6475 
+elapsed = 14.47	Round = 54	nrounds = 295.4522	eta = 0.2820	max_depth = 7.0000	gamma = 25.3393	Value = 0.6490 
+elapsed = 11.14	Round = 55	nrounds = 88.1316	eta = 0.5018	max_depth = 8.0000	gamma = 25.9212	Value = 0.6469 
+elapsed = 14.98	Round = 56	nrounds = 134.6511	eta = 0.2958	max_depth = 7.0000	gamma = 16.5997	Value = 0.6508 
+elapsed = 8.78	Round = 57	nrounds = 207.6589	eta = 0.5453	max_depth = 4.0000	gamma = 13.0626	Value = 0.6470 
+elapsed = 8.36	Round = 58	nrounds = 130.3892	eta = 0.5178	max_depth = 6.0000	gamma = 28.9023	Value = 0.6464 
+elapsed = 6.05	Round = 59	nrounds = 109.5790	eta = 0.0001	max_depth = 8.0000	gamma = 5.4102	Value = 0.6221 
+elapsed = 25.27	Round = 60	nrounds = 203.9543	eta = 0.1485	max_depth = 7.0000	gamma = 12.3047	Value = 0.6522
+
+
+
+3. With Unordered, NO Box Cox, and NO polynomials of ltv/assetcost
+
+ Best Parameters Found: 
+Round = 48	nrounds = 97.8491	eta = 0.2462	max_depth = 4.0000	gamma = 0.0000	Value = 0.6533 
+
+elapsed = 6.77	Round = 1	nrounds = 160.5492	eta = 0.9033	max_depth = 5.0000	gamma = 37.0404	Value = 0.6377 
+elapsed = 18.45	Round = 2	nrounds = 259.5085	eta = 0.1709	max_depth = 7.0000	gamma = 21.7586	Value = 0.6457 
+elapsed = 6.20	Round = 3	nrounds = 119.2579	eta = 0.6230	max_depth = 5.0000	gamma = 41.8309	Value = 0.6375 
+elapsed = 11.04	Round = 4	nrounds = 218.8128	eta = 0.2236	max_depth = 5.0000	gamma = 40.4956	Value = 0.6407 
+elapsed = 8.38	Round = 5	nrounds = 89.9119	eta = 0.6757	max_depth = 5.0000	gamma = 21.8069	Value = 0.6475 
+elapsed = 7.14	Round = 6	nrounds = 164.1822	eta = 0.9273	max_depth = 7.0000	gamma = 22.8778	Value = 0.6431 
+elapsed = 12.58	Round = 7	nrounds = 213.7903	eta = 0.2280	max_depth = 7.0000	gamma = 45.4787	Value = 0.6397 
+elapsed = 53.73	Round = 8	nrounds = 188.7243	eta = 0.4365	max_depth = 5.0000	gamma = 0.8332	Value = 0.6404 
+elapsed = 57.49	Round = 9	nrounds = 161.2658	eta = 0.0336	max_depth = 7.0000	gamma = 39.5276	Value = 0.6397 
+elapsed = 65.92	Round = 10	nrounds = 145.7863	eta = 0.3797	max_depth = 8.0000	gamma = 0.8308	Value = 0.6316 
+elapsed = 2.47	Round = 11	nrounds = 300.0000	eta = 0.0001	max_depth = 4.0000	gamma = 18.1048	Value = 0.6066 
+elapsed = 29.42	Round = 12	nrounds = 70.0822	eta = 0.1142	max_depth = 7.0000	gamma = 0.0000	Value = 0.6519 
+elapsed = 27.72	Round = 13	nrounds = 70.5460	eta = 0.5348	max_depth = 7.0000	gamma = 0.2992	Value = 0.6337 
+elapsed = 99.64	Round = 14	nrounds = 300.0000	eta = 1.0000	max_depth = 6.0000	gamma = 0.0000	Value = 0.5975 
+elapsed = 6.76	Round = 15	nrounds = 184.5125	eta = 0.9602	max_depth = 7.0000	gamma = 49.0057	Value = 0.6366 
+elapsed = 19.57	Round = 16	nrounds = 50.0000	eta = 0.9695	max_depth = 7.0000	gamma = 3.2660	Value = 0.6200 
+elapsed = 10.98	Round = 17	nrounds = 53.0251	eta = 0.2873	max_depth = 5.0000	gamma = 22.3114	Value = 0.6473 
+elapsed = 26.35	Round = 18	nrounds = 218.6570	eta = 0.3858	max_depth = 7.0000	gamma = 5.9736	Value = 0.6460 
+elapsed = 5.15	Round = 19	nrounds = 294.4063	eta = 0.0001	max_depth = 7.0000	gamma = 2.6619	Value = 0.6210 
+elapsed = 2.50	Round = 20	nrounds = 88.9038	eta = 0.0001	max_depth = 4.0000	gamma = 50.0000	Value = 0.6054 
+elapsed = 13.16	Round = 21	nrounds = 127.0833	eta = 0.0001	max_depth = 7.0000	gamma = 9.4437	Value = 0.6196 
+elapsed = 7.86	Round = 22	nrounds = 185.7444	eta = 0.7825	max_depth = 7.0000	gamma = 47.1432	Value = 0.6356 
+elapsed = 23.03	Round = 23	nrounds = 182.0262	eta = 0.1217	max_depth = 6.0000	gamma = 18.2819	Value = 0.6488 
+elapsed = 7.08	Round = 24	nrounds = 271.8768	eta = 0.3634	max_depth = 5.0000	gamma = 50.0000	Value = 0.6377 
+elapsed = 8.36	Round = 25	nrounds = 267.7967	eta = 0.4069	max_depth = 5.0000	gamma = 15.3082	Value = 0.6478 
+elapsed = 16.99	Round = 26	nrounds = 73.1894	eta = 0.0938	max_depth = 4.0000	gamma = 29.8492	Value = 0.6425 
+elapsed = 15.83	Round = 27	nrounds = 125.0624	eta = 0.3873	max_depth = 4.0000	gamma = 6.5199	Value = 0.6505 
+elapsed = 14.79	Round = 28	nrounds = 61.0400	eta = 0.7014	max_depth = 8.0000	gamma = 9.0092	Value = 0.6371 
+elapsed = 9.58	Round = 29	nrounds = 239.8205	eta = 0.3175	max_depth = 4.0000	gamma = 14.5078	Value = 0.6480 
+elapsed = 9.01	Round = 30	nrounds = 297.5685	eta = 0.3955	max_depth = 6.0000	gamma = 23.3146	Value = 0.6456 
+elapsed = 25.60	Round = 31	nrounds = 129.2810	eta = 0.0974	max_depth = 8.0000	gamma = 49.6123	Value = 0.6383 
+elapsed = 10.28	Round = 32	nrounds = 88.7252	eta = 0.3026	max_depth = 4.0000	gamma = 14.9993	Value = 0.6476 
+elapsed = 40.13	Round = 33	nrounds = 172.1484	eta = 0.7395	max_depth = 4.0000	gamma = 0.0000	Value = 0.6366 
+elapsed = 58.69	Round = 34	nrounds = 177.1399	eta = 0.3496	max_depth = 6.0000	gamma = 0.0000	Value = 0.6437 
+elapsed = 37.28	Round = 35	nrounds = 106.2001	eta = 0.0725	max_depth = 6.0000	gamma = 0.0000	Value = 0.6528 
+elapsed = 35.65	Round = 36	nrounds = 153.8335	eta = 0.1616	max_depth = 4.0000	gamma = 0.0000	Value = 0.6528 
+elapsed = 54.28	Round = 37	nrounds = 121.8328	eta = 0.8590	max_depth = 8.0000	gamma = 0.0000	Value = 0.6015 
+elapsed = 9.88	Round = 38	nrounds = 258.8680	eta = 0.1638	max_depth = 4.0000	gamma = 50.0000	Value = 0.6380 
+elapsed = 45.80	Round = 39	nrounds = 96.2140	eta = 0.0633	max_depth = 8.0000	gamma = 0.0000	Value = 0.6510 
+elapsed = 5.28	Round = 40	nrounds = 86.7487	eta = 0.7141	max_depth = 5.0000	gamma = 50.0000	Value = 0.6389 
+elapsed = 17.73	Round = 41	nrounds = 225.2961	eta = 0.6369	max_depth = 8.0000	gamma = 8.2753	Value = 0.6404 
+elapsed = 23.90	Round = 42	nrounds = 72.2194	eta = 0.2143	max_depth = 6.0000	gamma = 0.0000	Value = 0.6518 
+elapsed = 37.69	Round = 43	nrounds = 84.4088	eta = 0.2577	max_depth = 8.0000	gamma = 0.0000	Value = 0.6442 
+elapsed = 5.29	Round = 44	nrounds = 136.6870	eta = 0.5350	max_depth = 4.0000	gamma = 50.0000	Value = 0.6390 
+elapsed = 54.43	Round = 45	nrounds = 237.6820	eta = 0.6435	max_depth = 4.0000	gamma = 0.0000	Value = 0.6366 
+elapsed = 45.51	Round = 46	nrounds = 195.3811	eta = 0.2017	max_depth = 4.0000	gamma = 0.0000	Value = 0.6529 
+elapsed = 10.03	Round = 47	nrounds = 148.2779	eta = 0.5735	max_depth = 8.0000	gamma = 50.0000	Value = 0.6394 
+elapsed = 22.32	Round = 48	nrounds = 97.8491	eta = 0.2462	max_depth = 4.0000	gamma = 0.0000	Value = 0.6533 
+elapsed = 8.91	Round = 49	nrounds = 74.3508	eta = 0.6624	max_depth = 8.0000	gamma = 50.0000	Value = 0.6397 
+elapsed = 12.02	Round = 50	nrounds = 50.0000	eta = 0.4426	max_depth = 8.0000	gamma = 18.3145	Value = 0.6495 
+elapsed = 5.12	Round = 51	nrounds = 131.7423	eta = 0.0001	max_depth = 8.0000	gamma = 15.8447	Value = 0.6211 
+elapsed = 19.35	Round = 52	nrounds = 96.9269	eta = 0.2515	max_depth = 8.0000	gamma = 18.7790	Value = 0.6502 
+elapsed = 17.94	Round = 53	nrounds = 268.3936	eta = 0.4227	max_depth = 8.0000	gamma = 10.5443	Value = 0.6474 
+elapsed = 9.55	Round = 54	nrounds = 50.0000	eta = 0.4275	max_depth = 7.0000	gamma = 33.8611	Value = 0.6429 
+elapsed = 10.43	Round = 55	nrounds = 141.9663	eta = 0.4993	max_depth = 8.0000	gamma = 50.0000	Value = 0.6416 
+elapsed = 10.19	Round = 56	nrounds = 300.0000	eta = 0.5691	max_depth = 8.0000	gamma = 25.1622	Value = 0.6456 
+elapsed = 11.79	Round = 57	nrounds = 173.7019	eta = 0.3706	max_depth = 7.0000	gamma = 24.5475	Value = 0.6478 
+elapsed = 4.35	Round = 58	nrounds = 300.0000	eta = 0.7724	max_depth = 4.0000	gamma = 22.1148	Value = 0.6385 
+elapsed = 6.78	Round = 59	nrounds = 50.0000	eta = 0.5571	max_depth = 4.0000	gamma = 14.8043	Value = 0.6493 
+elapsed = 22.46	Round = 60	nrounds = 50.0000	eta = 0.1367	max_depth = 8.0000	gamma = 25.2469	Value = 0.6456 
+
+
+3. With ordered, No Box Cox, and No polynomials of ltv/assetcost
+
+

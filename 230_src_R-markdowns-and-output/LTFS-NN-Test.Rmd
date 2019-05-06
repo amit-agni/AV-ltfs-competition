@@ -1,0 +1,908 @@
+---
+title: "NN"
+author: "Amit Agni"
+date: "25/04/2019"
+output: html_document
+---
+
+### Initial Setup and Data Load
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+if (!require("pacman")) install.packages("pacman")
+p_load(caret,data.table,dplyr,lubridate
+       ,here,DescTools,DataExplorer,tidyverse
+       ,googledrive,e1071,ggcorrplot,forcats
+       ,xgboost,DiagrammeR,ROCR,cutpointr
+       ,MlBayesOpt,rBayesianOptimization)
+
+options(scipen=999) #remove scientific notation in printing 
+
+
+####### parallel on windows #######
+p_load(doParallel)
+cl <- makeCluster(detectCores(), type='PSOCK')
+#registerDoParallel(1)
+registerDoParallel(cl)
+
+# turn parallel processing off and run sequentially again:
+# registerDoSEQ()
+
+#####################################
+# parallel::detectCores()
+# 
+# p_load(doMC)
+# 
+# registerDoMC(cores = 4)
+# 
+# dribble <- drive_find(pattern="train.csv")
+# drive_download(as_dribble(dribble),overwrite = TRUE)
+# 
+# dribble <- drive_find(pattern="test.csv")
+# drive_download(as_dribble(dribble),overwrite = TRUE)
+# 
+# DT_train <- fread(here::here("train.csv"))
+# DT_test <- fread(here::here("test.csv"))
+#####################################
+
+
+DT_train <- fread(here::here("100_data_raw-input","train.csv"))
+DT_test <- fread(here::here("100_data_raw-input","test.csv"))
+DT_train$flag <- "train"
+DT_test$flag <- "test"
+DT_test$loan_default <- 1
+DT <- rbind(DT_train,DT_test)
+rm(DT_train)
+rm(DT_test)
+
+
+#### Remove the test observations ###############
+DT <- DT[flag=="train",]
+
+
+```
+
+
+### Feat Engg
+```{r}
+
+
+##################### Basic Cleanup #####################
+
+#to avoid date of births like 2068 instead of 1968
+DT$Date.of.Birth <- dplyr::if_else(dmy(DT$Date.of.Birth) > Sys.Date(),
+                                   dmy(DT$Date.of.Birth) - years(100),
+                                   dmy(DT$Date.of.Birth))
+DT$DisbursalDate <- dmy(DT$DisbursalDate)
+
+#Some Employment types are blank
+#Set them fo Self Employed (TO DO : Missing value Imputation)
+DT[flag=="train",.N,by=.(Employment.Type,loan_default)]
+DT[flag=="test",.N,by=.(Employment.Type,loan_default)]
+DT[,Employment.Type := ifelse(Employment.Type == "","Self employed",as.character(Employment.Type))]
+
+#remove ID column and mobile no (one level)
+DT$UniqueID <- NULL
+DT$MobileNo_Avl_Flag <- NULL
+
+
+########################## FLAG columns change to Factors ###########
+
+temp <- c("Employment.Type","Aadhar_flag","PAN_flag","VoterID_flag","Driving_flag","Passport_flag")
+DT[, (temp) := lapply(.SD, as.factor),.SDcols = temp]
+
+
+
+
+
+
+##################### DATES  #####################
+
+#source :https://stackoverflow.com/questions/1995933/number-of-months-between-two-dates/1996404
+#option did not work
+#https://stackoverflow.com/questions/10836503/convert-difftime-time-to-years-months-and-days
+#DT$age.at.disbursal <- as.POSIXct(c(difftime(DT$DisbursalDate,DT$Date.of.Birth, units = "secs")),origin = DT$Date.of.Birth)
+
+
+#convert into months
+DT[,avg.acct.age.months := as.integer(str_extract_all(AVERAGE.ACCT.AGE,"[0-9]+",simplify = TRUE)[,1]) * 12 +
+       as.integer(str_extract_all(AVERAGE.ACCT.AGE,"[0-9]+",simplify = TRUE)[,2])]
+DT[,time.since.first.loan.months := as.integer(str_extract_all(CREDIT.HISTORY.LENGTH,"[0-9]+",simplify = TRUE)[,1]) * 12 + 
+       as.integer(str_extract_all(CREDIT.HISTORY.LENGTH,"[0-9]+",simplify = TRUE)[,2])]
+DT$age.at.disbursal <- interval(DT$Date.of.Birth,DT$DisbursalDate) %/% months(1)
+DT$age.today <- interval(DT$Date.of.Birth,Sys.Date()) %/% months(1)
+
+
+DT[,`:=`(age.at.disbursal=round(age.at.disbursal/12,0)
+          ,age.today=round(age.today/12,0)
+          ,avg.acct.age.months=round(avg.acct.age.months/12,0)
+          ,time.since.first.loan.months=round(time.since.first.loan.months/12,0))]
+
+DT[,`:=`(age.when.first.loan = age.today - time.since.first.loan.months,
+         time.left.to.repay = avg.acct.age.months - time.since.first.loan.months)]
+
+
+lapply(DT[,.(age.at.disbursal
+         ,age.today
+         ,avg.acct.age.months
+         ,time.since.first.loan.months
+         ,age.when.first.loan
+         ,time.left.to.repay)],
+       function(x) prop.table(table(x)))
+
+
+#age.today
+#hist(DT$age.today)
+prop.table(table(cut(DT$age.today, 
+                     breaks=c(quantile(DT$age.today
+                                       ,probs = seq(0,1,0.25))))))
+DT[,age.today := cut(DT$age.today, 
+                                 breaks=c(quantile(DT$age.today
+                                                   ,probs = seq(0,1,0.25)))
+                                 ,ordered = TRUE)]
+
+#hist(DT$avg.acct.age.months)
+group_category(data = DT, feature = "avg.acct.age.months", threshold = 0.1,update = TRUE)
+DT[,avg.acct.age.months:=factor(avg.acct.age.months,ordered = TRUE)]
+
+
+#hist(DT$time.since.first.loan.months)
+group_category(data = DT, feature = "time.since.first.loan.months", threshold = 0.2,update = TRUE)
+DT[,time.since.first.loan.months:=factor(time.since.first.loan.months,ordered = TRUE)]
+
+
+#hist(DT$age.when.first.loan)
+prop.table(table(cut(DT$age.when.first.loan, 
+                     breaks=c(quantile(DT$age.when.first.loan
+                                       ,probs = seq(0,1,0.25))))))
+DT[,age.when.first.loan := cut(DT$age.when.first.loan, 
+                     breaks=c(quantile(DT$age.when.first.loan
+                                       ,probs = seq(0,1,0.25)))
+                     ,ordered = TRUE)]
+
+#hist(DT$time.left.to.repay)
+DT[,time.left.to.repay := factor(as.character(if_else(time.left.to.repay<0,1,0)))]
+
+
+
+DT$AVERAGE.ACCT.AGE <- NULL
+DT$CREDIT.HISTORY.LENGTH <- NULL
+DT$Date.of.Birth <- NULL
+DT$DisbursalDate <- NULL
+DT$age.at.disbursal <-NULL
+
+
+
+
+################### CREDIT SCORE  ###########
+
+prop.table(table(DT$PERFORM_CNS.SCORE.DESCRIPTION))
+
+DT[,PERFORM_CNS.SCORE.DESCRIPTION.new :=
+            case_when(
+                PERFORM_CNS.SCORE.DESCRIPTION == 'A-Very Low Risk' ~ 'Low',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'B-Very Low Risk' ~ 'Low',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'C-Very Low Risk' ~ 'Low',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'D-Very Low Risk' ~ 'Low',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'E-Low Risk' ~ 'Low',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'F-Low Risk' ~ 'Low',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'G-Low Risk' ~ 'Low',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'H-Medium Risk' ~ 'Med',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'I-Medium Risk' ~ 'Med',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'J-High Risk' ~ 'High',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'K-High Risk' ~ 'High',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'L-Very High Risk' ~ 'High',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'M-Very High Risk' ~ 'High',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'No Bureau History Available' ~ 'NoData',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'Not Scored: More than 50 active Accounts found' ~ 'OTHER',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'Not Scored: No Activity seen on the customer (Inactive)' ~ 'OTHER',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'Not Scored: No Updates available in last 36 months' ~ 'OTHER',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'Not Scored: Not Enough Info available on the customer' ~ 'OTHER',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'Not Scored: Only a Guarantor' ~ 'OTHER',
+                PERFORM_CNS.SCORE.DESCRIPTION == 'Not Scored: Sufficient History Not Available' ~ 'OTHER'
+            )]
+
+prop.table(table(DT$PERFORM_CNS.SCORE.DESCRIPTION.new))
+DT[,PERFORM_CNS.SCORE.DESCRIPTION.new := factor(PERFORM_CNS.SCORE.DESCRIPTION.new,
+                                                levels = c("Low","Med","High","Other","NoData"),
+                                                ordered = TRUE)]
+
+
+DT[,PERFORM_CNS.SCORE.DESCRIPTION:=NULL]
+DT[,PERFORM_CNS.SCORE:=NULL]
+
+
+
+##################### NO OF ACCOUNTS  + NO OF INQUIRIES #####################
+
+#Convert them to factors
+
+temp <- grep(".ACCTS|NO.OF",names(DT),value=TRUE)
+lapply(DT[,temp,with=FALSE], function(x) round(prop.table(table(x)),3))
+
+group_category(data = DT, feature = "PRI.NO.OF.ACCTS", threshold = 0.25,update = TRUE)
+group_category(data = DT, feature = "PRI.ACTIVE.ACCTS", threshold = 0.1,update = TRUE)
+DT[,PRI.OVERDUE.ACCTS := as.character(if_else(PRI.OVERDUE.ACCTS >0,1,0))]
+
+DT[,SEC.NO.OF.ACCTS := as.character(if_else(SEC.NO.OF.ACCTS >0,1,0))]
+DT[,SEC.ACTIVE.ACCTS := as.character(if_else(SEC.ACTIVE.ACCTS >0,1,0))]
+DT[,SEC.OVERDUE.ACCTS := as.character(if_else(SEC.OVERDUE.ACCTS >0,1,0))]
+
+group_category(data = DT, feature = "NEW.ACCTS.IN.LAST.SIX.MONTHS", threshold = 0.04,update = TRUE)
+DT[,DELINQUENT.ACCTS.IN.LAST.SIX.MONTHS := as.character(if_else(DELINQUENT.ACCTS.IN.LAST.SIX.MONTHS >0,1,0))]
+DT[,NO.OF_INQUIRIES := as.character(if_else(NO.OF_INQUIRIES >0,1,0))]
+
+#Convert them to ordered factors
+DT[,(temp):=lapply(.SD,function(x) factor(x,ordered=TRUE)),.SDcols = temp]
+
+# A GLM Model 
+# ORDERED vs UNORDEREDFACTORS
+# A glm model only on these shows a difference based on how the factors are coded
+# TO bE INTERPRETED
+# Source : http://www.win-vector.com/blog/2012/07/modeling-trick-impact-coding-of-categorical-variables-with-many-levels/
+
+# temp_DT <- data.frame(lapply(DT[,c(temp,"loan_default"),with=FALSE],as.factor))
+# temp_model <-glm(loan_default~ .
+#                  ,data = temp_DT
+#                  ,family = binomial(link="logit"))
+# summary(temp_model)
+# 
+# temp_DT <- data.frame(lapply(DT[,c(temp,"loan_default"),with=FALSE],function(x) factor(x,ordered=TRUE)))
+# temp_model <-glm(loan_default~ .
+#                  ,data = temp_DT
+#                  ,family = binomial(link="logit"))
+# summary(temp_model)
+
+
+
+##################### the SIX Id columns  #####################
+
+fn_id_cols <- function(DT,col) {
+    
+    print(col)
+    print(eval(col))
+    by_cols <- c(col,"loan_default")
+    print(by_cols)
+    
+    temp <- DT[flag=="train",.(.N,disbursed_amount=as.numeric(sum(disbursed_amount))),by=by_cols][
+        ,.(loan_default,
+           tot_loans = sum(N),
+           tot_disbursed_amount =as.numeric(sum(disbursed_amount)),
+           avg_loan_amount=as.numeric(sum(disbursed_amount)/sum(N)),
+           default.pct = N/sum(N)),
+        by = col][loan_default == 1][order(tot_loans)]
+    
+    temp[,paste0(col,".default_rate") := cut(temp$default.pct, breaks=c(quantile(temp$default.pct, probs = seq(0, 1, by = 1/3))), 
+                                        labels=c("Low","Med","High"),include.lowest = TRUE
+                                        ,ordered = TRUE)]
+    
+    temp[,paste0(col,".volume") := cut(temp$tot_loans, breaks=c(quantile(temp$tot_loans, probs = seq(0, 1, by = 1/3))), 
+                                  labels=c("Low","Med","High"),include.lowest = TRUE
+                                  ,ordered = TRUE)]
+    
+    temp[,paste0(col,".avg_loan_amount") := cut(temp$avg_loan_amount, breaks=c(quantile(temp$avg_loan_amount, probs = seq(0, 1, by = 1/3))), 
+                                           labels=c("Low","Med","High"),include.lowest = TRUE
+                                           ,ordered = TRUE)]
+    
+    temp[,`:=`(loan_default=NULL,tot_loans=NULL,tot_disbursed_amount=NULL,avg_loan_amount=NULL,default.pct=NULL)]
+
+    temp
+}
+
+####### Branch ID #################
+temp <- fn_id_cols(DT,"branch_id")
+nrow(DT)
+DT <- merge(DT,temp,by="branch_id")
+nrow(DT)
+
+
+
+####### Supplier ID #################
+temp <- fn_id_cols(DT,"supplier_id")
+nrow(DT)
+DT <- merge(DT,temp,by="supplier_id",all.x = TRUE)
+nrow(DT)
+
+#Impute the NA values
+DT[is.na(supplier_id.default_rate),.(supplier_id.default_rate)] 
+temp <- names(which(prop.table(table(DT$supplier_id.default_rate)) == max(prop.table(table(DT$supplier_id.default_rate)))))
+DT[is.na(supplier_id.default_rate),supplier_id.default_rate:= (temp)] 
+DT[is.na(supplier_id.default_rate),.(supplier_id.default_rate)] 
+
+
+DT[is.na(supplier_id.volume),.(supplier_id.volume)] 
+temp <- names(which(prop.table(table(DT$supplier_id.volume)) == max(prop.table(table(DT$supplier_id.volume)))))
+DT[is.na(supplier_id.volume),supplier_id.volume:= (temp)] 
+DT[is.na(supplier_id.volume),.(supplier_id.volume)] 
+
+
+DT[is.na(supplier_id.avg_loan_amount),.(supplier_id.avg_loan_amount)] 
+temp <- names(which(prop.table(table(DT$supplier_id.avg_loan_amount)) == max(prop.table(table(DT$supplier_id.avg_loan_amount)))))
+DT[is.na(supplier_id.avg_loan_amount),supplier_id.avg_loan_amount:= (temp)] 
+DT[is.na(supplier_id.avg_loan_amount),.(supplier_id.avg_loan_amount)] 
+
+
+
+####### Manufacturer ID #################
+temp <- fn_id_cols(DT,"manufacturer_id")
+nrow(DT)
+DT <- merge(DT,temp,by="manufacturer_id",all.x = TRUE)
+nrow(DT)
+
+#Impute the NA values
+DT[is.na(manufacturer_id.default_rate),.(manufacturer_id.default_rate)] 
+temp <- names(which(prop.table(table(DT$manufacturer_id.default_rate)) == max(prop.table(table(DT$manufacturer_id.default_rate)))))
+DT[is.na(manufacturer_id.default_rate),manufacturer_id.default_rate:= (temp)] 
+DT[is.na(manufacturer_id.default_rate),.(manufacturer_id.default_rate)] 
+
+
+DT[is.na(manufacturer_id.volume),.(manufacturer_id.volume)] 
+temp <- names(which(prop.table(table(DT$manufacturer_id.volume)) == max(prop.table(table(DT$manufacturer_id.volume)))))
+DT[is.na(manufacturer_id.volume),manufacturer_id.volume:= (temp)] 
+DT[is.na(manufacturer_id.volume),.(manufacturer_id.volume)] 
+
+
+DT[is.na(manufacturer_id.avg_loan_amount),.(manufacturer_id.avg_loan_amount)] 
+temp <- names(which(prop.table(table(DT$manufacturer_id.avg_loan_amount)) == max(prop.table(table(DT$manufacturer_id.avg_loan_amount)))))
+DT[is.na(manufacturer_id.avg_loan_amount),manufacturer_id.avg_loan_amount:= (temp)] 
+DT[is.na(manufacturer_id.avg_loan_amount),.(manufacturer_id.avg_loan_amount)] 
+
+
+
+####### Employee_code_ID #################
+temp <- fn_id_cols(DT,"Employee_code_ID")
+nrow(DT)
+DT <- merge(DT,temp,by="Employee_code_ID",all.x = TRUE)
+nrow(DT)
+
+#Impute the NA values
+DT[is.na(Employee_code_ID.default_rate),.(Employee_code_ID.default_rate)] 
+temp <- names(which(prop.table(table(DT$Employee_code_ID.default_rate)) == max(prop.table(table(DT$Employee_code_ID.default_rate)))))
+DT[is.na(Employee_code_ID.default_rate),Employee_code_ID.default_rate:= (temp)] 
+DT[is.na(Employee_code_ID.default_rate),.(Employee_code_ID.default_rate)] 
+
+
+DT[is.na(Employee_code_ID.volume),.(Employee_code_ID.volume)] 
+temp <- names(which(prop.table(table(DT$Employee_code_ID.volume)) == max(prop.table(table(DT$Employee_code_ID.volume)))))
+DT[is.na(Employee_code_ID.volume),Employee_code_ID.volume:= (temp)] 
+DT[is.na(Employee_code_ID.volume),.(Employee_code_ID.volume)] 
+
+
+DT[is.na(Employee_code_ID.avg_loan_amount),.(Employee_code_ID.avg_loan_amount)] 
+temp <- names(which(prop.table(table(DT$Employee_code_ID.avg_loan_amount)) == max(prop.table(table(DT$Employee_code_ID.avg_loan_amount)))))
+DT[is.na(Employee_code_ID.avg_loan_amount),Employee_code_ID.avg_loan_amount:= (temp)] 
+DT[is.na(Employee_code_ID.avg_loan_amount),.(Employee_code_ID.avg_loan_amount)] 
+
+
+
+####### State_ID  #################
+temp <- fn_id_cols(DT,"State_ID")
+nrow(DT)
+DT <- merge(DT,temp,by="State_ID")
+nrow(DT)
+
+
+####### Current_pincode_ID  #################
+temp <- fn_id_cols(DT,"Current_pincode_ID")
+nrow(DT)
+DT <- merge(DT,temp,by="Current_pincode_ID",all.x = TRUE)
+nrow(DT)
+
+#Impute the NA values
+DT[is.na(Current_pincode_ID.default_rate),.(Current_pincode_ID.default_rate)] 
+temp <- names(which(prop.table(table(DT$Current_pincode_ID.default_rate)) == max(prop.table(table(DT$Current_pincode_ID.default_rate)))))
+temp
+DT[is.na(Current_pincode_ID.default_rate),Current_pincode_ID.default_rate:= (temp)] 
+DT[is.na(Current_pincode_ID.default_rate),.(Current_pincode_ID.default_rate)] 
+
+
+DT[is.na(Current_pincode_ID.volume),.(Current_pincode_ID.volume)] 
+temp <- names(which(prop.table(table(DT$Current_pincode_ID.volume)) == max(prop.table(table(DT$Current_pincode_ID.volume)))))
+temp
+DT[is.na(Current_pincode_ID.volume),Current_pincode_ID.volume:= (temp)] 
+DT[is.na(Current_pincode_ID.volume),.(Current_pincode_ID.volume)] 
+
+
+DT[is.na(Current_pincode_ID.avg_loan_amount),.(Current_pincode_ID.avg_loan_amount)] 
+temp <- names(which(prop.table(table(DT$Current_pincode_ID.avg_loan_amount)) == max(prop.table(table(DT$Current_pincode_ID.avg_loan_amount)))))
+temp
+DT[is.na(Current_pincode_ID.avg_loan_amount),Current_pincode_ID.avg_loan_amount:= (temp)] 
+DT[is.na(Current_pincode_ID.avg_loan_amount),.(Current_pincode_ID.avg_loan_amount)] 
+
+
+#drop the id features
+temp <- c("branch_id","supplier_id","Current_pincode_ID","State_ID","Employee_code_ID","manufacturer_id")
+DT[,(temp) := NULL]
+
+
+
+##############################################
+#########   BRING BACK THE AMOUNTS ###########
+##############################################
+
+#Earlier code that was deleting it
+#temp <- grep("PRI|SEC|PRIMARY|disbursed_amount|asset_cost",
+#     names(DT),value = TRUE)
+#DT[,(temp):=NULL]
+
+
+temp <- grep("PRI|SEC|PRIMARY",names(DT),value = TRUE)
+
+#plot_histogram(DT[,(temp),with = FALSE])
+
+DT[,PRI.CURRENT.BALANCE.bin := as.character(if_else(PRI.CURRENT.BALANCE >0,1,0))]
+DT[,PRI.DISBURSED.AMOUNT.bin := as.character(if_else(PRI.DISBURSED.AMOUNT >0,1,0))]
+DT[,PRI.SANCTIONED.AMOUNT.bin := as.character(if_else(PRI.SANCTIONED.AMOUNT >0,1,0))]
+DT[,PRIMARY.INSTAL.AMT.bin := as.character(if_else(PRIMARY.INSTAL.AMT >0,1,0))]
+
+
+DT[,SEC.CURRENT.BALANCE.bin := as.character(if_else(SEC.CURRENT.BALANCE >0,1,0))]
+DT[,SEC.DISBURSED.AMOUNT.bin := as.character(if_else(SEC.DISBURSED.AMOUNT >0,1,0))]
+DT[,SEC.SANCTIONED.AMOUNT.bin := as.character(if_else(SEC.SANCTIONED.AMOUNT >0,1,0))]
+DT[,SEC.INSTAL.AMT.bin := as.character(if_else(SEC.INSTAL.AMT >0,1,0))]
+
+#Convert the above bins to factors
+temp <- names(which(lapply(DT,is.character)==TRUE))
+DT[,(temp) := lapply(.SD, as.factor) , .SDcols = (temp)]
+
+# #Convert ordered to unordered on some features
+# temp <- names(which(lapply(DT,is.ordered)==TRUE))[1:9]
+# temp <- c()
+# DT[,(temp) := lapply(.SD,function(x) factor(x,ordered = FALSE)), .SDcols = temp]
+
+
+
+################## Work the Numeric features ###############
+
+which(lapply(DT, is.numeric)==TRUE)
+
+DT[,PRI.CURRENT.BALANCE := PRI.CURRENT.BALANCE + SEC.CURRENT.BALANCE]
+DT[,SEC.CURRENT.BALANCE := NULL]
+
+DT[,PRI.SANCTIONED.AMOUNT := PRI.SANCTIONED.AMOUNT + SEC.SANCTIONED.AMOUNT]
+DT[,SEC.SANCTIONED.AMOUNT := NULL]
+
+DT[,PRIMARY.INSTAL.AMT := PRIMARY.INSTAL.AMT + SEC.INSTAL.AMT]
+DT[,SEC.INSTAL.AMT := NULL]
+
+DT[,PRI.DISBURSED.AMOUNT := PRI.DISBURSED.AMOUNT + SEC.DISBURSED.AMOUNT]
+DT[,SEC.DISBURSED.AMOUNT := NULL]
+
+#some ratios
+DT[,asset_cost_ratio := asset_cost / disbursed_amount ]
+DT[,ltv_asset_cost_ratio := asset_cost / ltv ]
+DT[,ltv_disbursed_amount_ratio := disbursed_amount / ltv ]
+
+
+
+################# Polynomials ##################
+
+# nos <- 5
+# temp <- data.frame(poly(DT$ltv,nos))
+# colnames(temp) <- paste0("ltv",seq(1,nos,1))
+# DT <- cbind(DT,temp)
+# 
+# temp <- data.frame(poly(DT$asset_cost,nos))
+# colnames(temp) <- paste0("asset_cost",seq(1,nos,1))
+# DT <- cbind(DT,temp)
+
+
+
+##################### BOX COX  #####################
+#Box Cox transformation of numeric columns
+
+temp <-names(which(lapply(DT,is.numeric)==TRUE))
+
+preProcValues <- preProcess(DT[,(temp),with = FALSE], method = "BoxCox")
+DT_tran <- predict(preProcValues, DT[,(temp),with = FALSE])
+
+#remove the columns from DT and cbind the transformed columns
+DT[,(temp) := NULL]
+
+DT <- cbind(DT,DT_tran)
+
+rm(DT_tran)
+rm(preProcValues)
+
+
+
+
+##################################################
+########       Fix the data Leakage      #########
+##################################################
+
+temp <- grep("default",names(DT),value = TRUE)
+temp <- temp[-grep("loan_default",temp)]
+DT[,(temp):=NULL]
+
+
+##################################################
+####### High continuous correlated       #########
+##################################################
+
+plot_correlation(DT,type = "continuous")
+
+DT[,disbursed_amount := NULL]
+DT[,asset_cost := NULL]
+DT[,ltv := NULL]
+
+DT[,PRI.SANCTIONED.AMOUNT := NULL]
+
+DT[,ltv_disbursed_amount_ratio:= NULL]
+DT[,asset_cost_ratio := NULL]
+
+# DT[,SEC.SANCTIONED.AMOUNT := NULL]
+
+
+
+##################################################
+#######       Remove the FLAG           #########
+##################################################
+
+DT$flag <- NULL
+
+vars <- c("Employment.Type", "Aadhar_flag","PAN_flag","VoterID_flag","Driving_flag","Passport_flag"
+          ,"DELINQUENT.ACCTS.IN.LAST.SIX.MONTHS","NO.OF_INQUIRIES", "age.today",
+          "PERFORM_CNS.SCORE.DESCRIPTION.new", "PRI.CURRENT.BALANCE.bin","PRIMARY.INSTAL.AMT.bin",
+          "ltv","PRI.CURRENT.BALANCE","PRIMARY.INSTAL.AMT","loan_default")
+
+
+
+#DT <- DT[,(vars),with=FALSE]
+
+
+###########################################################
+#######       Change ORDERED to UNORDERED         #########
+###########################################################
+
+str(DT)
+temp <- names(which(lapply(DT,is.ordered) == TRUE))
+temp
+DT[, (temp) := lapply(.SD, function(x) as.factor(as.character(x))), .SDcols = temp]
+
+
+```
+
+
+### Model Data Prep
+```{r}
+
+index <- createDataPartition(y=DT$loan_default, p=0.5
+                             , list=FALSE) 
+my_train <- DT[index,]
+my_test <- DT[-index,]
+
+
+#prop.table(table(is.na(my_train)))
+#prop.table(table(is.na(my_test)))
+
+my_train <- my_train[complete.cases(my_train)]
+my_test <- my_test[complete.cases(my_test)]
+
+
+#prop.table(table(is.na(my_train)))
+#prop.table(table(is.na(my_test)))
+
+
+my_train_labels <- my_train$loan_default
+my_train$loan_default <- NULL
+
+my_test_labels <- my_test$loan_default 
+my_test$loan_default <- NULL
+
+dummies <- dummyVars(~., data = my_train, fullRank = TRUE)
+my_train <- predict(dummies, newdata = my_train)
+
+dummies <- dummyVars(~., data = my_test,fullRank = TRUE)
+my_test <- predict(dummies, newdata = my_test)
+
+
+my_train <- as.matrix(my_train)
+my_test <- as.matrix(my_test)
+
+dim(my_train)
+
+
+```
+
+### NN
+```{r}
+
+#https://github.com/rstudio/keras/issues/693
+#tensorflow::install_tensorflow(version = "1.12")
+
+
+#keras::normalize(my_train)
+p_load(keras)
+rm(model)
+model <- keras_model_sequential() 
+model %>% 
+    layer_dense(units = 512, activation = 'relu', input_shape = c(70)) %>% 
+    layer_batch_normalization()%>%
+    layer_dropout(rate = 0.4) %>% 
+    layer_dense(units = 512, activation = 'relu') %>%
+#    layer_dense(units = 8, activation = 'relu') %>%
+#    layer_dropout(rate = 0.5) %>% 
+    layer_dense(units = 1, activation = 'sigmoid')
+
+model %>% compile(
+     loss = 'binary_crossentropy',
+     optimizer = 'adam',
+     metrics = 'accuracy'
+ )
+
+model %>% fit(
+     my_train, 
+     my_train_labels, 
+     epochs = 300, 
+     batch_size = 50, 
+     validation_split = 0.2
+ )
+
+summary(model)
+  
+probs <- model %>% predict_proba(my_test, batch_size = 50)
+summary(probs)
+
+classes <- model %>% predict_classes(my_test, batch_size = 128)
+prop.table(table(classes))
+
+# 
+# #devtools::install_github("rstudio/tensorflow")
+# #tensorflow::install_tensorflow()
+# 
+# summary(model)
+# model %>% 
+#   layer_dense(units = 1024, activation = 'relu', input_shape = c(52)) %>%
+#  # layer_batch_normalization()
+# #    layer_dropout(rate = 0.4) 
+# 
+# 
+#   layer_dense(units = 1024, activation = 'relu') %>%
+#   layer_batch_normalization() %>%
+#   layer_dropout(rate = 0.3) %>%
+#   layer_dense(units = 32, activation = 'tanh') %>%
+#   layer_dropout(rate = 0.5) %>%
+#   layer_dense(units = 1, activation = 'relu') %>%
+# summary(model)
+
+
+```
+
+
+### Bayesian Optimisation
+```{r}
+
+
+
+my_train <- xgb.DMatrix(my_train, label = my_train_labels)
+my_test <- xgb.DMatrix(my_test, label = my_test_labels)
+
+watchlist <- list(test = my_test, train = my_train)
+
+
+opt_fn <- function(nrounds, eta, max_depth,gamma) {
+    
+    xgb_model <- xgb.train(
+        params = list(
+            booster = "gbtree"
+            ,objective = "binary:logistic"
+            ,eval_metric = "auc"
+            ,eta = eta
+            ,max_depth=max_depth
+            ,gamma = gamma)
+    ,data = my_train
+    ,watchlist = watchlist
+    ,nrounds = nrounds
+    ,early_stopping_rounds = 10
+    ,verbose = TRUE
+    ,prediction = TRUE) 
+    
+    list(
+        #Score = xgb_model$best_score
+        Score = xgb_model$evaluation_log[xgb_model$best_iteration]$test_auc
+        ,Pred = xgb_model$pred)
+  
+}
+
+
+opt_res <- BayesianOptimization(opt_fn
+                                ,bounds = list(
+                                    nrounds = c(50,300)
+                                    ,eta = c(0.0001,1)
+                                    ,max_depth = c(4L,8L)
+                                    ,gamma = c(0,50))
+                                ,init_grid_dt = NULL
+                                ,init_points = 10
+                                ,n_iter = 50
+                                ,acq = "ucb"
+                                ,kappa = 2.576
+                                ,eps = 0.0
+                                ,verbose = TRUE)
+
+
+
+#  Best Parameters Found: 
+# Round = 20	nrounds = 149.5553	eta = 0.1680	max_depth = 7.0000	gamma = 14.6431	Value = 0.6522 
+
+# elapsed = 7.16	Round = 5	nrounds = 286.3347	eta = 0.4040	max_depth = 6.0000	gamma = 25.3421	Value = 0.6497 
+# elapsed = 34.88	Round = 60	nrounds = 86.2078	eta = 0.0929	max_depth = 7.0000	gamma = 0.0000	Value = 0.6516 
+# elapsed = 16.94	Round = 73	nrounds = 500.0000	eta = 0.1028	max_depth = 5.0000	gamma = 18.7949	Value = 0.6510 
+# elapsed = 18.61	Round = 80	nrounds = 222.9636	eta = 0.1366	max_depth = 7.0000	gamma = 7.9687	Value = 0.6525 
+
+
+```
+
+
+### Predict and Evaluate
+```{r}
+
+xgb_model <- xgb.train(
+    params = list(
+        booster = "gbtree"
+        ,objective = "binary:logistic"
+        ,eval_metric = "auc"
+        ,eta = 0.137
+        ,max_depth=7
+        ,gamma = 7.97)
+,data = my_train
+,watchlist = watchlist
+,nrounds = 223
+,early_stopping_rounds = 10
+,verbose = TRUE
+,prediction = TRUE) 
+
+
+# Learning Curve
+ggplot(melt(xgb_model$evaluation_log,id.vars = "iter")) +
+    geom_line(aes(x=iter, y=value, color=variable))
+
+importance <- xgb.importance(model = xgb_model)
+importance
+xgb.plot.importance(importance)
+
+
+pred <- predict(xgb_model,newdata = my_test)
+summary(pred)
+
+#ROC Curves to find the optimal cutoff 
+p_load(PRROC)
+fg <- pred[my_test_labels == 1]
+bg <- pred[my_test_labels == 0]
+roc <- roc.curve(scores.class0 = fg, scores.class1 = bg, curve = T)
+plot(roc)
+pr <- pr.curve(scores.class0 = fg, scores.class1 = bg, curve = T)
+plot(pr)
+
+prob_pred <- ifelse(pred > 0.3288902,1,0)
+prop.table(table(prob_pred))
+
+confusionMatrix(factor(prob_pred),factor(my_test_labels))
+
+
+
+# Other XGB plots [TO BE REVIEWED]
+#xgb.plot.multi.trees(model = xgb_model)
+#xgb.plot.deepness(model=xgb_model)
+#xgb.plot.shap()
+#xgb.plot.tree(model=xgb_model)
+
+
+# Feature contributions [HOW CAN THIS BE USED]
+#pred <- predict(xgb_model,newdata = my_test ,predcontrib = TRUE)
+
+
+
+```
+
+
+
+
+### Submission
+```{r}
+
+####################################################
+##########           Submission           ##########
+####################################################
+
+pred <- predict(xgb_model,newdata = my_test)
+summary(pred)
+prob_pred <- ifelse(pred > 0.5,1,0)
+prop.table(table(prob_pred))
+
+
+get_unique_ids <- fread(here::here("100_data_raw-input","test.csv"))
+
+submit_kaggle <- as.data.frame(cbind(get_unique_ids$UniqueID,pred))
+colnames(submit_kaggle) <- c("UniqueID","loan_default")
+
+write.csv(submit_kaggle
+          ,file = here("120_data_output"
+                       ,paste0("Submit_XGB_",strftime(Sys.time(), format="%Y%m%d_%H%M%S"),".csv"))
+          ,row.names = FALSE)
+
+
+```
+
+
+
+Misc Code and Notes
+
+```{r}
+
+
+
+####################################################
+##########             Notes              ##########
+####################################################
+
+#XGB recognizes that many of your features are not important and didn't use them in the process of building decision trees. 
+#You can force XGB to use all of them by increasing max tree depth setting, but you are overfitting the data this way.
+
+#https://www.kaggle.com/c/santander-customer-satisfaction/discussion/20662
+#https://www.analyticsvidhya.com/blog/2016/03/complete-guide-parameter-tuning-xgboost-with-codes-python/
+#https://xgboost.readthedocs.io/en/latest/parameter.html
+
+
+
+temp <-names(which(lapply(test,is.factor)==TRUE))
+
+dummies <- dummyVars(~., data = test[,(temp),with=FALSE])
+test_factors <-  as.data.frame(predict(dummies, newdata = test[,(temp),with=FALSE]))
+
+
+head(test_factors)
+
+test[,(temp):=NULL]
+test <- data.matrix(cbind(test,test_factors))
+
+
+#Good explanation .. this one made me icnrease the number of trees
+#https://stats.stackexchange.com/questions/204489/discussion-about-overfit-in-xgboost
+#http://www.stat.columbia.edu/~jakulin/Int/
+    
+
+#Examples
+#https://www.kaggle.com/aniruddhachakraborty/lasso-gbm-xgboost-top-20-0-12039-using-r
+#https://www.kaggle.com/serigne/stacked-regressions-top-4-on-leaderboard
+#https://www.kaggle.com/jingfengzhu/machine-learning-with-xgboost-in-r-workbook
+
+
+### Increasing the scale_pos_weight to 20, increased the probabilities as below
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#0.2668  0.6703  0.7480  0.7211  0.7961  0.8428 
+# Indicating that higher weight was put on the positive observations
+# Confusion Matrix and Statistics (for p>0.5)
+#               Reference
+# Prediction     0     1
+#           0  1581    82
+#           1 34791 10176
+
+#Reducing it to 5, did not change much and also reduing the max_depth from 15 to 5 did not change anything
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#0.2942  0.4631  0.5425  0.5393  0.6201  0.7500 
+# Confusion Matrix and Statistics
+#               Reference
+# Prediction     0     1
+#               0 15126  1752
+#               1 21246  8506
+
+
+
+#### OPTIMAL CUTPOINTS #####
+
+
+opt_cut <- cutpointr::cutpointr(x=predicted,
+                                    class=actual_loan_defaults,
+                                
+                                    method = maximize_metric,
+                                    #metric = F1_score,
+                                    metric = cohens_kappa,
+                                    direction = ">=",
+                                    pos_class = 1)
+plot(opt_cut)
+plot_metric(opt_cut)
+
+
+```
+

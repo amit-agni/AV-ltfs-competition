@@ -1,0 +1,137 @@
+---
+title: "LTFS Competiion Summary"
+author: "Amit Agni"
+date: "22/04/2019"
+output:
+  md_document:
+    variant: markdown_github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(here,data.table)
+```
+
+
+This is a quick summary for the [Analytics Vidhya LTFS hackathon](https://datahack.analyticsvidhya.com/contest/ltfs-datascience-finhack-an-online-hackathon/) that took place between 12-22April2019
+
+* My CV score was around 0.68 but the LB score did not cross 0.5. There were 2-3 possible causes for this :
+    + The id columns (branch id, current pin code id, etc) were all encoded using the target (loan_default) column. And then
+    + Feature engineering was done by combining the Test and Train dataset. This possibly resulted in data leakage
+    + The range of the predicted probabilities was very narrow (0.4-0.6), though I was expecting atleast few to touch the extremes (0 or 1)
+
+    
+### My journey   
+
+* Basic EDA is documented in [EDA-report.html](`r here("230_src_R-markdowns-and-output","EDA-report.html")`)
+* The FE and modeling code is [LTFS-Model-xgb_20190422.R](`r here("210_src_R-scripts","LTFS-Model-xgb_20190422.R")`)
+* The function created for parameter grid tuning is [FUNC_parameter-grid-tuning.R](`r here("210_src_R-scripts","FUNC_parameter-grid-tuning.R")`)
+* Modeling using caret on EC2 giving error _"In nominalTrainWorkflow(x = x, y = y, wts = weights, info = trainInfo,  : There were missing values in resampled performance measures."_ even though there were not missing values  
+* Models tried gbm,parRF,glmnet. Was not able to install catboost in R
+* Finally settled with xgboost (without caret)  
+    
+    
+### New Learnings
+
+* Use of purrr::p_map for model automation
+* Xgboost hyperparameters 
+    + max_depth : no of features to be used in each model (Higher => overfitting)
+    + subsample : Sampling of observations
+    + colsample_bytree : Sampling of features
+    + scale_pos_weight : gives higher weightage to the positive target values
+    + Increase nround for slower eta 
+        * Good explanation .. this one made me increase the number of trees. (https://stats.stackexchange.com/questions/204489/discussion-about-overfit-in-xgboost)
+
+* A simple glm model on these Ordered vs Unordered factors showed a difference (TO BE INTERPRETED)
+    + (http://www.win-vector.com/blog/2012/07/modeling-trick-impact-coding-of-categorical-variables-with-many-levels/)
+* Other useful links :
+    * https://www.kaggle.com/c/santander-customer-satisfaction/discussion/20662
+    * https://www.analyticsvidhya.com/blog/2016/03/complete-guide-parameter-tuning-xgboost-with-codes-python/
+    * http://www.stat.columbia.edu/~jakulin/Int/
+
+* New packages : DataExplorer, catboost, lightgbm, cutpointr
+* New Concepts : Time Series Cross validation
+
+
+### Lessons / Unanswered questions / TO DO
+
+* Time spent should be 80% FE 20% modeling but mine was opposite
+* Need to investigate the feature importance plots. Is feature selection necessary in tree based models ?
+* Is collinearity a problem in tree based models  ?
+and do feature selection
+
+
+
+### Sample winning solutions (Referred)
++ https://www.kaggle.com/aniruddhachakraborty/lasso-gbm-xgboost-top-20-0-12039-using-r
++ https://www.kaggle.com/serigne/stacked-regressions-top-4-on-leaderboard
++ https://www.kaggle.com/jingfengzhu/machine-learning-with-xgboost-in-r-workbook
+
+
+
+
+### Other Competitors
+
+* The leaderboard and participants approaches 
+    + [Leaderboard](https://datahack.analyticsvidhya.com/contest/ltfs-datascience-finhack-an-online-hackathon/pvt_lb)
+    + [LB 13](https://github.com/rajat5ranjan/AV-LTFS-Data-Science-FinHack-ML-Hackathon/blob/master/Final_Submission.ipynb)
+        * Combined train/test
+        * Added PRI + SEC to create new feature
+        * Used catboost with : n_estimators=3000,random_state=1994,eval_metric='AUC',
+        max_depth=6,learning_rate=0.029,od_wait=50,l2_leaf_reg=5,
+        cat_features=categorical_features_indices
+        ,bagging_temperature=0.85,random_strength=100
+        * K-Folds cross validation helps curbs overfitting
+
+    + [LB 36](https://github.com/sk48880/LTFS-Data-Science-Finhack---Anlytics-Vidhya/blob/master/Loan_Default_Prediction_EDA_%26_Gradient_Boosting.ipynb)
+        * Dropped some of the outliers
+        * Feature engineering Train and Test separately
+        
+    + [LB 81](https://github.com/jasjotiitr/LTFS-Data-Science-FinHack/blob/master/loan%20default%20prediction-final-submit.ipynb)
+        * Group By branch id,etc same like what I did but did not use loan_default column
+        * Combined Train and Test for FE
+        * Log transformed amounts
+        * Used catboost with : cat_features= [3,6,7,8,62],  max_depth=5, reg_lambda=3
+    +[MK](https://github.com/mohsinkhn/ltfs-av)
+        * Outlier treatment
+        * word2vec
+
+
+
+### Tuning Parameters and Model performance
+
+* nrounds = 400
+* early_stopping_rounds = 200
+* nfold = 5
+  
+* eta = c(0.1,0.01,0.001)
+* max_depth = c(3,5,8)
+* min_child_weight = c(1,5,30)
+* subsample = c(0.1,0.3)
+* colsample_bylevel = c(0.1,0.3)
+* gamma=c(0,25,50)
+* scale_pos_weight = c(1,1.5)
+              
+#### Top 5 models with lowest CV train/test
+```{r}
+DT <- data.table::fread(here("120_data_output","RESULTS_tuning-grid_MODEL-NAME_2019-04-22_1.csv"))
+DT$CV_train_test <- DT$mean_train - DT$min_test
+
+head(DT[order(CV_train_test)])
+
+```
+#### Top 5 models with highest test set accuracy
+
+```{r}
+head(DT[order(-cf_accuracy)])
+
+```
+
+#### Top 5 models with highest Kappa
+
+```{r}
+head(DT[order(-cf_kappa)])
+
+```
+
+
